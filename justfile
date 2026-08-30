@@ -23,12 +23,21 @@ test:
 test-race:
     go test -count=1 -race ./...
 
+# Race + coverage, used by CI. Excludes the integration tag on purpose.
+test-ci:
+    go test -count=1 -race -coverprofile=coverage.out ./...
+
 # Requires a live salt-master and root. Auto-skips when the socket is absent.
 test-integration:
     go test -count=1 -p 1 -tags=integration ./...
 
 vuln:
     go tool govulncheck ./...
+
+# Fails if `go mod tidy` would change go.mod / go.sum.
+tidy:
+    go mod tidy
+    git diff --exit-code -- go.mod go.sum
 
 check: fmt-check vet lint test
 

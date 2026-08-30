@@ -6,5 +6,8 @@
 /dist/
 /site/
 
+# Coverage profile written by `just test-ci`
+/coverage.out
+
 # Local env
 .envrc
