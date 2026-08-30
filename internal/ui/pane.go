@@ -50,4 +50,39 @@ type Pane interface {
 
 	// SetStyles re-styles any component caching its own styles.
 	SetStyles(st *theme.Styles)
+
+	// Keys lists the keys THIS pane owns, for the hint line the root renders
+	// under the frame. The global keys (pane jumps, theme, filter, pause,
+	// help, quit) are already on that line from the keymap, so repeating them
+	// here only makes the pane's own keys harder to pick out.
+	//
+	// It is called every frame, so a pane whose bindings depend on its state
+	// should report what is true NOW rather than a fixed list.
+	//
+	// Returning nil is legitimate for a pane that binds nothing, and is the
+	// point of the method being mandatory rather than optional: a pane that
+	// never grew a hint line is otherwise indistinguishable from one that has
+	// no keys, and the difference cannot be tested. A method makes the empty a
+	// deliberate, reviewable, testable choice — and the root renders whatever
+	// comes back, so the Rate pane's `F` toggle (spec §9) cannot ship
+	// undiscoverable.
+	Keys() []KeyHint
+}
+
+// KeyHint is one pane-owned key and what it does, as shown on the hint line.
+//
+// Two fields, not more. The root owns the separator, the styling, and the
+// truncation; the pane owns only the order. A pane that could pass a style or
+// a width through here would drift from its neighbours, which is exactly how
+// the sibling project's per-pane footers ended up formatted three different
+// ways.
+//
+// Key is written the way the operator types it — "F", "enter", "←/→" for a
+// pair that does one job. Label is the verb phrase, lowercase, no trailing
+// punctuation: "fit to window", "next job".
+type KeyHint struct {
+	// Key is the keystroke, as printed.
+	Key string
+	// Label is what pressing it does.
+	Label string
 }

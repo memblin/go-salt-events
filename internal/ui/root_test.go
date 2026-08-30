@@ -9,6 +9,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/muesli/termenv"
 
 	"github.com/TKC-Labs/go-salt-events/internal/filter"
@@ -47,6 +48,11 @@ func (s stubSource) Snapshot(filter.Query, int) ui.Snapshot {
 type stubPane struct {
 	title string
 
+	// hints is what Keys reports. Most stubs leave it nil, which is the
+	// ordinary case of a pane that binds nothing and must render no hint group
+	// at all.
+	hints []ui.KeyHint
+
 	// st and viewSt record the two separate routes styles reach a pane by, so
 	// the theme guard can tell "SetStyles was called" from "View was handed
 	// the new set". A real pane can get one and miss the other.
@@ -67,6 +73,8 @@ func (p *stubPane) View(w, _ int, _ ui.Snapshot, st *theme.Styles) string {
 }
 
 func (p *stubPane) SetStyles(st *theme.Styles) { p.st = st }
+
+func (p *stubPane) Keys() []ui.KeyHint { return p.hints }
 
 func ready(t *testing.T, m ui.Model, w, h int) ui.Model {
 	t.Helper()
@@ -129,10 +137,13 @@ func newModelPanes(t *testing.T) (ui.Model, []*stubPane) {
 	}), stubs
 }
 
+// stubPanes mirrors the real build: most panes bind nothing of their own, and
+// Rate owns the `F` toggle from spec §9 — the binding that motivated Keys.
 func stubPanes() []*stubPane {
 	return []*stubPane{
 		{title: "Live"}, {title: "Detail"},
-		{title: "Rate"}, {title: "Summary"}, {title: "Jobs"},
+		{title: "Rate", hints: []ui.KeyHint{{Key: "F", Label: "fit"}}},
+		{title: "Summary"}, {title: "Jobs"},
 	}
 }
 
@@ -339,5 +350,105 @@ func TestPanesAreGivenStylesAtConstruction(t *testing.T) {
 
 	if p.st == nil {
 		t.Error("NewModel did not call SetStyles on its panes")
+	}
+}
+
+// hintRow returns the rendered hint line, ANSI stripped. It is the chrome row
+// directly above the status bar (tabs, frame, filter bar, HINTS, status), so
+// asserting on it proves the hints reached the frame in the place the operator
+// reads, not merely that the string appears somewhere on screen.
+func hintRow(t *testing.T, view string) string {
+	t.Helper()
+
+	lines := strings.Split(ansi.Strip(view), "\n")
+	if len(lines) < 2 {
+		t.Fatalf("view has %d line(s); there is no hint row", len(lines))
+	}
+
+	return lines[len(lines)-2]
+}
+
+// TestTheFocusedPanesKeysReachTheHintLine is the reason Keys exists. A method
+// nothing renders leaves a binding exactly as undiscoverable as no method at
+// all, so this asserts the rendered row rather than the method's return value.
+//
+// The separator is the marker for "a pane contributed a group": it appears on
+// this row only when there are pane hints, so its absence is how the empty
+// cases prove nothing dangling was drawn.
+func TestTheFocusedPanesKeysReachTheHintLine(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		hints   []ui.KeyHint
+		want    []string
+		notWant []string
+	}{
+		{
+			name:  "a pane-owned key is advertised alongside the global keys",
+			hints: []ui.KeyHint{{Key: "F", Label: "fit"}},
+			want:  []string{"F fit", "q quit", "·"},
+		},
+		{
+			name: "several keys keep the pane's own order",
+			hints: []ui.KeyHint{
+				{Key: "F", Label: "fit"},
+				{Key: "enter", Label: "open"},
+			},
+			want: []string{"F fit  enter open"},
+		},
+		{
+			name:    "a pane with no keys contributes no group",
+			hints:   nil,
+			want:    []string{"q quit"},
+			notWant: []string{"·"},
+		},
+		{
+			name:    "an empty hint is dropped rather than drawn",
+			hints:   []ui.KeyHint{{}},
+			want:    []string{"q quit"},
+			notWant: []string{"·"},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+
+			m := ui.NewModel(stubSource{},
+				[]ui.Pane{&stubPane{title: "Rate", hints: c.hints}},
+				ui.Options{Theme: "gruvbox-dark"})
+
+			row := hintRow(t, ready(t, m, 120, 24).View())
+
+			for _, want := range c.want {
+				if !strings.Contains(row, want) {
+					t.Errorf("hint row %q does not contain %q", row, want)
+				}
+			}
+
+			for _, notWant := range c.notWant {
+				if strings.Contains(row, notWant) {
+					t.Errorf("hint row %q contains %q, want it absent", row, notWant)
+				}
+			}
+		})
+	}
+}
+
+// TestSwitchingPanesSwitchesTheHints covers the state the hint line exists for:
+// a pane-owned binding is only live while that pane is focused, so a stale
+// hint would advertise a key that does nothing.
+func TestSwitchingPanesSwitchesTheHints(t *testing.T) {
+	t.Parallel()
+
+	m := ready(t, newModel(t), 120, 30)
+
+	if row := hintRow(t, keys(t, m, "3").View()); !strings.Contains(row, "F fit") {
+		t.Errorf("focusing Rate did not show its own key: hint row %q", row)
+	}
+
+	if row := hintRow(t, keys(t, m, "1").View()); strings.Contains(row, "F fit") {
+		t.Errorf("focusing a keyless pane left Rate's key on screen: hint row %q", row)
 	}
 }
