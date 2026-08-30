@@ -82,7 +82,24 @@ a report of the effective configuration. For that, press `?` in the running
 console, which shows the socket path and the config path this session actually
 resolved.
 
-### Undocumented in `-h`: the capture flags
+### `--version`
+
+```console
+$ salt-events --version
+salt-events v0.1.0 (a1b2c3d, built 2026-08-30T21:00:00Z, go1.26.6)
+```
+
+Prints to stdout and exits 0, so it pipes cleanly. It is answered before the
+configuration is loaded, so it works on a host with no socket, no config file
+and no Salt at all — which is exactly the situation in which someone is asking
+which binary they have.
+
+A build from a release tag reports that tag. A local `just build` reports
+`git describe`, with `-dirty` appended when the working tree has uncommitted
+changes. A `go install` build has no linker stamps at all and falls back to the
+VCS revision Go embeds automatically, so it still identifies itself.
+
+### The capture flags
 
 ```bash
 sudo salt-events --capture=200 --capture-out=internal/saltipc/testdata/live-frames.bin
@@ -91,10 +108,13 @@ sudo salt-events --capture=200 --capture-out=internal/saltipc/testdata/live-fram
 
 `--capture N --capture-out PATH` records `N` raw frames off the live bus,
 verbatim including the length prefixes, and exits without starting the console.
-It exists to regenerate the test fixtures, and it is deliberately absent from
-`-h` and from the config file, the environment namespace and the precedence
-table: a fixture recorder is not a runtime setting. Both flags are required
-together; `--capture` without `--capture-out` is an error.
+It exists to regenerate the test fixtures. Both flags are required together;
+`--capture` without `--capture-out` is an error.
+
+They are listed in `-h` under "Fixture recording", but deliberately kept out of
+the config file, the environment namespace and the precedence table: a fixture
+recorder is a different program that happens to share a binary, not a runtime
+setting.
 
 ## 4. Configuration
 

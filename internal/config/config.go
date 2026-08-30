@@ -52,6 +52,10 @@ const (
 // cmd/salt-events actually parses, so a rename there fails the build's tests
 // rather than silently rotting the help output.
 const UsageExtra = `
+Other modes:
+  -version
+    	print the version and exit
+
 Fixture recording (see just capture):
   -capture int
     	record N frames from the bus and exit, instead of starting the console
