@@ -1,0 +1,85 @@
+version: "2"
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - unused
+    - ineffassign
+    - nilerr
+    - errorlint
+    - contextcheck
+    - durationcheck
+    - copyloopvar
+    - makezero
+    - wastedassign
+    - gosec
+    - revive
+    - gocritic
+    - gocognit
+    - misspell
+    - unconvert
+    - predeclared
+    - goconst
+    - thelper
+    - tparallel
+    - usetesting
+    - forbidigo
+    - depguard
+
+  settings:
+    gocognit:
+      min-complexity: 15
+
+    # Spec §3.2: live theme switching breaks the moment one pane hardcodes a
+    # colour. That pane looks correct under the theme it was written in and
+    # silently never changes with the others, so it is caught here, not by review.
+    forbidigo:
+      forbid:
+        - pattern: 'lipgloss\.Color\('
+          msg: "colour literals belong in internal/theme only (spec §3.2)"
+        - pattern: 'lipgloss\.AdaptiveColor\('
+          msg: "colour literals belong in internal/theme only (spec §3.2)"
+
+    # Spec §3.1, enforced rather than documented.
+    depguard:
+      rules:
+        ui-must-not-import-ingest:
+          files:
+            - "**/internal/ui/**"
+          deny:
+            - pkg: github.com/TKC-Labs/go-salt-events/internal/saltipc
+              desc: "the UI must not import the ingest layer; it reads snapshots (spec §3.1)"
+            - pkg: github.com/vmihailenco/msgpack/v5
+              desc: "the UI must never decode wire format (spec §3.1)"
+
+        ingest-must-not-import-tui:
+          files:
+            - "**/internal/saltipc/**"
+            - "**/internal/salttag/**"
+            - "**/internal/cache/**"
+            - "**/internal/filter/**"
+            - "**/internal/stats/**"
+            - "**/internal/config/**"
+            - "**/internal/model/**"
+          deny:
+            - pkg: github.com/charmbracelet/bubbletea
+              desc: "the ingest layer must not import bubbletea (spec §3.1)"
+            - pkg: github.com/charmbracelet/lipgloss
+              desc: "the ingest layer must not import lipgloss (spec §3.1)"
+            - pkg: github.com/charmbracelet/bubbles
+              desc: "the ingest layer must not import bubbles (spec §3.1)"
+
+  exclusions:
+    rules:
+      - path: 'internal/theme/'
+        linters:
+          - forbidigo
+      - path: 'internal/theme/registry\.go'
+        linters:
+          - goconst
+      - path: '_test\.go'
+        linters:
+          - gosec
+          - goconst
