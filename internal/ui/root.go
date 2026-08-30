@@ -60,6 +60,13 @@ type Model struct {
 	// cannot linger and be read as current.
 	notice string
 
+	// readerErr is §8.1's diagnosis of a reader that has stopped. Unlike a
+	// notice it survives keystrokes and is dismissed only by esc: the reader
+	// does not come back, so everything on screen from here is history, and a
+	// message that scrolled away on the next keypress would leave the operator
+	// staring at a frozen console with no explanation.
+	readerErr string
+
 	interval   time.Duration
 	sockPath   string
 	configPath string
@@ -174,6 +181,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.notice = string(msg)
 
 		return m, nil
+
+	case ReaderErrorMsg:
+		m.readerErr = string(msg)
+
+		return m, nil
 	}
 
 	return m.routeToPane(msg)
@@ -283,6 +295,12 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch key {
 	case keyQuit, keyInterrupt:
 		return m, tea.Quit
+	case keyEscape:
+		// The only way out of the reader diagnosis. It is not cleared by any
+		// other key, because the operator has to be able to read it.
+		m.readerErr = ""
+
+		return m, nil
 	case keyNextPane, keyPrevPane:
 		m.focus = m.step(key)
 
@@ -456,10 +474,7 @@ func (m Model) View() string {
 	// time, so an unfocused border would never be drawn.
 	frame := m.styles.PaneFocus.Width(contentW).Height(contentH)
 
-	body := m.helpView(contentW, contentH)
-	if !m.showHelp {
-		body = m.panes[m.focus].View(contentW, contentH, m.snap, m.styles)
-	}
+	body := m.bodyView(contentW, contentH)
 
 	return lipgloss.JoinVertical(lipgloss.Left,
 		m.tabsView(m.width),
@@ -468,4 +483,22 @@ func (m Model) View() string {
 		m.hintsView(m.width),
 		m.statusView(m.width),
 	)
+}
+
+// bodyView picks what fills the pane frame.
+//
+// The help overlay wins because the operator explicitly asked for it. A dead
+// reader comes next, ahead of the pane: a console rendering a live-looking
+// Live pane off a socket that closed twenty minutes ago is the one outcome
+// spec §8.1 exists to prevent, and DISCONNECTED in the status bar has already
+// been shown not to be enough on its own.
+func (m Model) bodyView(w, h int) string {
+	switch {
+	case m.showHelp:
+		return m.helpView(w, h)
+	case m.readerErr != "":
+		return m.readerErrView(w, h)
+	default:
+		return m.panes[m.focus].View(w, h, m.snap, m.styles)
+	}
 }

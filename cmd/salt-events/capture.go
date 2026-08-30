@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -124,6 +123,10 @@ const maxCaptureFrame = 64 << 20
 
 // captureFrames records n raw frames from the live socket into out.
 //
+// It takes the sock DIRECTORY, never a file path, for the same reason
+// saltipc.NewReader does: the basename is not the caller's to give
+// (invariant 1, layer 1).
+//
 // Fixtures MUST come from the real bus. A hand-written fixture encodes our
 // assumptions about the wire format and would pass even when those assumptions
 // are wrong — which is exactly the failure this project is most exposed to
@@ -132,8 +135,15 @@ const maxCaptureFrame = 64 << 20
 // The frames are written back byte for byte, prefix included, so the file is a
 // verbatim recording of the stream rather than a re-encoding of our reading of
 // it. Nothing here decodes anything, and nothing here writes to the socket.
-func captureFrames(sockPath, out string, n int) error {
-	conn, err := net.Dial("unix", sockPath)
+func captureFrames(sockDir, out string, n int) error {
+	// Through saltipc's own guarded dial, never a bare net.Dial: a second dial
+	// beside the guarded one gets layer 1 of invariant 1 and silently skips
+	// layer 2, which is the symlink re-check — the only route left to
+	// master_event_pull.ipc once the basename is derived rather than supplied.
+	reader := saltipc.NewReader(sockDir, clock.Now)
+	sockPath := reader.SocketPath()
+
+	conn, err := reader.Dial()
 	if err != nil {
 		return errors.New(saltipc.Diagnose(sockPath, err))
 	}

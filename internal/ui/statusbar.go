@@ -133,6 +133,45 @@ func (m Model) helpView(w, h int) string {
 	return strings.Join(lines, "\n")
 }
 
+// readerErrView fills the pane frame with §8.1's diagnosis of a dead reader.
+//
+// It replaces the pane rather than sitting in the one-line filter bar because
+// the remedy is the whole point and it does not fit on one line: the operator
+// needs "permission denied" AND `sudo salt-events` under it, and a line
+// truncated at the terminal width would deliver the first without the second —
+// which is what they already had.
+//
+// The text comes from the wiring layer, not from the bus, but it is sanitised
+// like everything else: it quotes a resolved socket path, and this tool runs
+// as root.
+func (m Model) readerErrView(w, h int) string {
+	lines := []string{
+		m.styles.Err.Render(components.Fit(components.Sanitise(readerStoppedHeadline), w)),
+		"",
+	}
+
+	for _, raw := range strings.Split(strings.TrimRight(m.readerErr, "\n"), "\n") {
+		lines = append(lines, m.styles.Value.Render(components.Fit(components.Sanitise(raw), w)))
+	}
+
+	lines = append(lines, "", m.styles.Muted.Render(components.Fit(readerErrDismiss, w)))
+
+	if len(lines) > h {
+		lines = lines[:h]
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+// readerStoppedHeadline says what the diagnosis below it does not: the console
+// is still drawing, and everything in it is now history.
+const readerStoppedHeadline = "THE EVENT READER STOPPED — nothing new is arriving; " +
+	"what follows is why, and what is on screen is what was collected before it"
+
+// readerErrDismiss names the only key that clears this block. A message with
+// no stated way out reads as a wedged console.
+const readerErrDismiss = "esc  dismiss (the reader does not restart; quit and fix the cause)"
+
 // helpKeyLines renders the global block followed by the focused pane's own.
 //
 // The pane's keys are here because the `?` overlay is where an operator looks
@@ -231,10 +270,34 @@ func (m Model) filterBarView(w int) string {
 		// ruling — there is one implementation of this).
 		return style.Render(m.styles.Warn.Render(components.Sanitise(m.notice)))
 	case !m.query.IsZero():
-		return style.Render(m.styles.Muted.Render("filter: " + m.query.String()))
+		return style.Render(m.styles.Muted.Render("filter: " + m.query.String() + m.reachNote()))
 	default:
 		return ""
 	}
+}
+
+// reachNote says how far back the snapshot actually looked, and only when it
+// stopped short.
+//
+// The cache bounds its scan so a selective filter cannot walk the whole ring
+// under the ingest lock (see cache.Snapshot, invariant 6). The cost of that
+// bound is reach: a matching event further back than the budget is still
+// retained, and still exported, but is not drawn. Saying so is the difference
+// between "the filter looked back this far" and an empty pane that reads as
+// "there are no such events" — the same distinction spec §6 makes about a
+// malformed query, and for the same reason.
+//
+// Two conditions, both required. An unfilled viewport alone is the ordinary
+// case of a quiet master; a scan short of the cache alone is the ordinary case
+// of a filter that matched a screenful straight away. Only together do they
+// mean the bound actually bit.
+func (m Model) reachNote() string {
+	if len(m.snap.Events) >= snapshotLimit || m.snap.Scanned >= m.snap.Cache.Events {
+		return ""
+	}
+
+	return fmt.Sprintf(" · looked back %d of %d retained events; w exports the whole set",
+		m.snap.Scanned, m.snap.Cache.Events)
 }
 
 // statusView renders connection, cache pressure, pause state, and theme.

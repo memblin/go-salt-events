@@ -140,22 +140,67 @@ func (c *Cache) degrade() {
 	}
 }
 
+// scanBudget is how far back Snapshot looks for matches, as a multiple of the
+// caller's limit.
+//
+// It is what makes the scan O(limit) rather than O(cache), and it exists
+// because the caller (the hub) runs Snapshot under the INGEST mutex: every
+// event examined here is an event the reader goroutine is blocked for, ten
+// times a second. Without the bound, a filter matching few or no retained
+// events walked the entire ring on every tick — 22.1 ms of blocked ingest at
+// the default 256 MiB budget and roughly 88 ms at --max-memory 1G, which is
+// the whole render interval. That is precisely the storm-wedging failure
+// invariant 6 exists to prevent, and it appeared in the one situation the
+// console exists for: an operator narrowing the filter during a storm.
+//
+// 8 is a deliberate compromise, not a tuned number. It is large enough that
+// the bound never bites on a filter that matches anything like the viewport's
+// worth of recent events, and small enough that the worst case stays under a
+// millisecond. Raising it trades ingest headroom for reach; the honest way to
+// widen the reach is the export (`w`), which scans everything.
+const scanBudget = 8
+
 // Snapshot returns up to limit events matching m, oldest first, taking the
-// newest matches when there are more than limit of them. A nil m matches
-// everything; a limit of zero or less returns nothing.
+// newest matches when there are more than limit of them, together with how
+// many retained events it examined. A nil m matches everything; a limit of
+// zero or less returns nothing.
 //
 // It copies, so the UI can render from it without holding the hub's lock —
 // which is what keeps render cost O(visible rows) and independent of ingest
 // rate (spec §4.1, invariant 6). The copy is shallow: Payload's bytes are
 // shared with the cache and must be treated as read-only.
-func (c *Cache) Snapshot(m Matcher, limit int) []model.Event {
+//
+// # The scan is bounded, and that is visible
+//
+// The walk stops after scanBudget × limit events even if it has not filled
+// limit, so the cost of a tick is a function of the viewport and not of the
+// cache. That is a real loss of reach: a matching event further back than the
+// budget will not appear, even though it is still retained and will still be
+// exported. The returned count is how a caller tells the two apart — equal to
+// Stats().Events means the scan reached the oldest retained event and the view
+// is complete for this query; less means "the filter looked back this far".
+// Drawing an empty pane without saying which of those happened would read as
+// "there are no such events", which is a different and much worse message.
+func (c *Cache) Snapshot(m Matcher, limit int) ([]model.Event, int) {
 	if limit <= 0 {
-		return nil
+		return nil, 0
 	}
 
 	out := make([]model.Event, 0, min(limit, len(c.events)))
 
-	for i := len(c.events) - 1; i >= 0 && len(out) < limit; i-- {
+	// limit reaches this from a caller, so the multiplication is checked: a
+	// limit near maxInt would wrap to a negative budget and return nothing at
+	// all, turning a silly argument into an empty console.
+	budget := limit * scanBudget
+	if budget < limit || budget > len(c.events) {
+		budget = len(c.events)
+	}
+
+	scanned := 0
+
+	for i := len(c.events) - 1; i >= 0 && len(out) < limit && scanned < budget; i-- {
+		scanned++
+
 		if m == nil || m.Match(c.events[i]) {
 			out = append(out, c.events[i])
 		}
@@ -166,7 +211,7 @@ func (c *Cache) Snapshot(m Matcher, limit int) []model.Event {
 		out[i], out[j] = out[j], out[i]
 	}
 
-	return out
+	return out, scanned
 }
 
 // All returns every retained event, oldest first. Used by export and tests.

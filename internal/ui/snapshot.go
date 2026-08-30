@@ -48,6 +48,20 @@ type Snapshot struct {
 
 	Events []model.Event
 
+	// Scanned is how many retained events the cache examined to build Events.
+	//
+	// It is here because the scan is BOUNDED (see cache.Snapshot): a selective
+	// filter stops after a fixed multiple of limit rather than walking the
+	// whole ring, which is what keeps render cost O(visible rows) and off the
+	// ingest lock. That bound is a real loss of reach, so it is reported
+	// rather than hidden — a pane drawing nothing must be able to say "the
+	// filter looked back this far" instead of implying "there are no such
+	// events".
+	//
+	// Compare it with Cache.Events: equal means the scan reached the oldest
+	// retained event and the view is complete for the active query.
+	Scanned int
+
 	Cache cache.Stats
 
 	Seconds []stats.Bucket

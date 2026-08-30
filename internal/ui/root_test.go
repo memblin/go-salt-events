@@ -14,6 +14,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 	"github.com/muesli/termenv"
 
+	"github.com/TKC-Labs/go-salt-events/internal/cache"
 	"github.com/TKC-Labs/go-salt-events/internal/filter"
 	"github.com/TKC-Labs/go-salt-events/internal/model"
 	"github.com/TKC-Labs/go-salt-events/internal/theme"
@@ -699,6 +700,152 @@ func TestANoticeIsClearedByTheNextKeystroke(t *testing.T) {
 
 	if strings.Contains(ansi.Strip(m.View()), "something happened") {
 		t.Error("the notice survived a keystroke")
+	}
+}
+
+// TestABoundedScanSaysHowFarItLooked keeps the fix for invariant 6 honest.
+//
+// The cache now stops scanning after a fixed multiple of the limit, so a
+// selective filter cannot walk the whole ring under the ingest lock. The cost
+// is reach: a matching event deeper than the budget is still retained and
+// still exported, but is not drawn. An empty pane that did not say so would
+// read as "there are no such events".
+func TestABoundedScanSaysHowFarItLooked(t *testing.T) {
+	t.Parallel()
+
+	src := stubSource{snap: ui.Snapshot{
+		// Nothing matched, and the scan stopped a long way short of the oldest
+		// retained event.
+		Events:  nil,
+		Scanned: 16000,
+		Cache:   cache.Stats{Events: 512345},
+	}}
+
+	m := ready(t, newModelWith(t, src), 160, 30)
+	m = step(t, m, ui.TickMsg(time.Now()))
+	m = keys(t, m, "/minion:nobody")
+	m = step(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	view := ansi.Strip(m.View())
+
+	for _, want := range []string{"looked back", "16000", "512345"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("the filter bar does not carry %q:\n%s", want, view)
+		}
+	}
+}
+
+// TestACompleteScanSaysNothingExtra: the caveat must appear only when the
+// bound actually bit. A filter that found a screenful straight away, and a
+// quiet master whose whole cache was scanned, are both ordinary.
+func TestACompleteScanSaysNothingExtra(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]ui.Snapshot{
+		"the scan reached the oldest retained event": {
+			Events:  []model.Event{{Tag: "salt/auth"}},
+			Scanned: 3,
+			Cache:   cache.Stats{Events: 3},
+		},
+		"the viewport filled before the bound": {
+			Events:  make([]model.Event, 2000),
+			Scanned: 2000,
+			Cache:   cache.Stats{Events: 512345},
+		},
+	}
+
+	for name, snap := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			m := ready(t, newModelWith(t, stubSource{snap: snap}), 160, 30)
+			m = step(t, m, ui.TickMsg(time.Now()))
+			m = keys(t, m, "/minion:nobody")
+			m = step(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+			if view := ansi.Strip(m.View()); strings.Contains(view, "looked back") {
+				t.Errorf("the filter bar warns about reach when the scan was complete:\n%s", view)
+			}
+		})
+	}
+}
+
+// TestADeadReaderTakesOverThePaneAndSaysWhy is the TUI half of spec §8.1.
+//
+// The reader returns permanently on any first-dial failure, so the two most
+// common first-run problems — forgetting sudo, and a master mid-restart —
+// produced a console showing nothing but DISCONNECTED, with the reason printed
+// only after the operator gave up and quit. The remedy is multi-line, so it
+// takes the pane body: the one-line filter bar would deliver the cause and
+// truncate away the fix, which is the state this is meant to end.
+func TestADeadReaderTakesOverThePaneAndSaysWhy(t *testing.T) {
+	t.Parallel()
+
+	const remedy = "this tool must run as root:"
+
+	m := ready(t, newModel(t), 120, 30)
+
+	if strings.Contains(ansi.Strip(m.View()), remedy) {
+		t.Fatal("premise failed: the remedy is already on screen with no reader error")
+	}
+
+	if !strings.Contains(ansi.Strip(m.View()), "[Live]") {
+		t.Fatal("premise failed: the focused pane never rendered")
+	}
+
+	m = step(t, m, ui.ReaderErrorMsg(
+		"cannot read /run/salt/master/master_event_pub.ipc: permission denied.\n\n"+
+			"The Salt master event socket is owned by root with mode 0600, so\n"+
+			remedy+"\n\n    sudo salt-events\n"))
+
+	view := ansi.Strip(m.View())
+
+	for _, want := range []string{remedy, "sudo salt-events", "THE EVENT READER STOPPED"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("the reader diagnosis does not carry %q:\n%s", want, view)
+		}
+	}
+
+	if strings.Contains(view, "[Live]") {
+		t.Error("the pane is still drawing over a socket that closed; a live-looking " +
+			"view of stale data is the outcome §8.1 exists to prevent")
+	}
+
+	// A notice is cleared by the next keystroke. This must NOT be: the operator
+	// needs time to read it, and no other key may take it away.
+	m = keys(t, m, "1")
+
+	if !strings.Contains(ansi.Strip(m.View()), "sudo salt-events") {
+		t.Error("the reader diagnosis was cleared by an ordinary keystroke")
+	}
+
+	m = step(t, m, tea.KeyMsg{Type: tea.KeyEscape})
+
+	after := ansi.Strip(m.View())
+
+	if strings.Contains(after, "sudo salt-events") {
+		t.Error("esc did not dismiss the reader diagnosis")
+	}
+
+	if !strings.Contains(after, "[Live]") {
+		t.Error("dismissing the diagnosis did not give the pane its body back")
+	}
+}
+
+// TestTheHelpOverlayStillWinsOverADeadReader: `?` is an explicit request, and
+// an operator who cannot reach the key list is worse off than one who has to
+// press `?` twice.
+func TestTheHelpOverlayStillWinsOverADeadReader(t *testing.T) {
+	t.Parallel()
+
+	m := ready(t, newModel(t), 120, 30)
+	m = step(t, m, ui.ReaderErrorMsg("cannot read the socket: permission denied"))
+	m = keys(t, m, "?")
+
+	view := ansi.Strip(m.View())
+
+	if !strings.Contains(view, "filter language") {
+		t.Errorf("the help overlay did not open over the reader diagnosis:\n%s", view)
 	}
 }
 

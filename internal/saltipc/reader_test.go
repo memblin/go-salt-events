@@ -2,10 +2,12 @@ package saltipc_test
 
 import (
 	"context"
+	"errors"
 	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -40,6 +42,7 @@ type recordSink struct {
 	events []model.Event
 	gaps   []gapWindow
 	errs   int
+	attach []bool
 
 	reachedOnce sync.Once
 	reached     chan struct{}
@@ -72,6 +75,28 @@ func (s *recordSink) DecodeError(error) {
 	defer s.mu.Unlock()
 
 	s.errs++
+}
+
+// Attached records every level change the reader reports, in order, so a test
+// can assert on the SEQUENCE rather than only on the final value — "connected,
+// then not, then connected again" is a different story from "still connected",
+// and only the sequence tells them apart.
+func (s *recordSink) Attached(attached bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.attach = append(s.attach, attached)
+}
+
+// attaches returns the recorded Attached sequence.
+func (s *recordSink) attaches() []bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	out := make([]bool, len(s.attach))
+	copy(out, s.attach)
+
+	return out
 }
 
 func (s *recordSink) snapshot() ([]model.Event, []gapWindow, int) {
@@ -571,6 +596,125 @@ func TestReaderRefusesASocketThatResolvesElsewhere(t *testing.T) {
 	}
 }
 
+// TestReaderReportsWhetherItHoldsTheSocket is where connectedness comes from.
+//
+// There was no such signal, so the hub inferred it from event arrival — which
+// makes a healthy but quiet master read DISCONNECTED, and makes the Gap that
+// CLOSES an outage window read as a fresh one. The sequence matters more than
+// the final value: "attached, lost, attached again" is the story of a master
+// restart, and only the ordered record can tell it from "still attached".
+func TestReaderReportsWhetherItHoldsTheSocket(t *testing.T) {
+	t.Parallel()
+
+	srv := newBusServer(t, pubSocket)
+	srv.serve(frame(t, "salt/auth", map[string]any{"act": "accept"}), 2, 0)
+
+	sink := newRecordSink(2)
+
+	if err := runUntil(t, saltipc.NewReader(srv.dir, time.Now), sink); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	got := sink.attaches()
+
+	if len(got) < 3 {
+		t.Fatalf("Attached was reported %v; a connect/drop/reconnect cycle must "+
+			"produce at least true, false, true", got)
+	}
+
+	if !got[0] {
+		t.Errorf("the first Attached report was %v; the socket was open before any "+
+			"event arrived, and a quiet master is a healthy master", got[0])
+	}
+
+	if !slices.Contains(got, false) {
+		t.Errorf("Attached never went false across a disconnect: %v", got)
+	}
+
+	// The reader must be reporting attached again by the time the second
+	// connection is delivering events; otherwise a successful reconnect still
+	// renders as an outage.
+	last := slices.Index(got, false)
+	if !slices.Contains(got[last:], true) {
+		t.Errorf("Attached never went true again after the reconnect: %v", got)
+	}
+}
+
+// TestReaderReportsAFailedFirstDialAsDetached covers the path Run returns on:
+// a first dial that fails is permanent, and a console left reading "connected"
+// for a reader that has died is the worst of both.
+func TestReaderReportsAFailedFirstDialAsDetached(t *testing.T) {
+	t.Parallel()
+
+	sink := newRecordSink(1)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+
+	// A directory with no socket in it at all.
+	err := saltipc.NewReader(t.TempDir(), time.Now).Run(ctx, sink)
+	if err == nil {
+		t.Fatal("Run returned nil for a socket that does not exist")
+	}
+
+	got := sink.attaches()
+	if len(got) != 1 || got[0] {
+		t.Errorf("Attached reports = %v, want exactly one false", got)
+	}
+}
+
+// TestNotPubSocketIsIdentifiableAndDiagnosable pins the SENTINEL, which is a
+// separate contract from the message text the test above checks.
+//
+// Two things branch on errors.Is(err, ErrNotPubSocket) and neither reads the
+// text: Run refuses to retry it (every other dial failure drives the backoff
+// loop, and retrying this one forever would be exactly the wrong response to
+// "that is not our socket"), and Diagnose turns it into invariant 1's
+// explanation rather than a bare errno. An error that stopped wrapping the
+// sentinel would leave both silently taking the wrong branch, and the existing
+// message assertion would still pass.
+func TestNotPubSocketIsIdentifiableAndDiagnosable(t *testing.T) {
+	t.Parallel()
+
+	srv := newBusServer(t, pullSocket)
+	srv.serve(nil, 1, 0)
+
+	if err := os.Symlink(filepath.Join(srv.dir, pullSocket),
+		filepath.Join(srv.dir, pubSocket)); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	reader := saltipc.NewReader(srv.dir, time.Now)
+
+	conn, err := reader.Dial()
+	if err == nil {
+		_ = conn.Close()
+
+		t.Fatal("Dial opened a publish socket that resolves to the pull socket")
+	}
+
+	if !errors.Is(err, saltipc.ErrNotPubSocket) {
+		t.Fatalf("Dial returned %v, which does not identify itself as ErrNotPubSocket; "+
+			"Run would retry it forever and Diagnose would print a bare errno", err)
+	}
+
+	if srv.acceptCount() != 0 {
+		t.Error("the pull socket was connected to; invariant 1 is broken")
+	}
+
+	got := saltipc.Diagnose(reader.SocketPath(), err)
+
+	for _, want := range []string{
+		"refusing to open",
+		"structurally incapable of injecting events",
+		pubSocket,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("Diagnose(%v) does not mention %q:\n%s", err, want, got)
+		}
+	}
+}
+
 // TestReaderReportsAGapAcrossAReconnect covers spec §8.2: a disconnection that
 // draws as a flat line at zero is indistinguishable from a quiet master, which
 // is exactly backwards during an incident.
@@ -696,6 +840,8 @@ func (s *ringSink) Gap(from, to time.Time) {
 }
 
 func (s *ringSink) DecodeError(error) {}
+
+func (s *ringSink) Attached(bool) {}
 
 func (s *ringSink) summarySeconds() (stats.Summary, stats.Bucket) {
 	s.mu.Lock()

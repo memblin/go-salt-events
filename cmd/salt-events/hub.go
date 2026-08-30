@@ -135,8 +135,6 @@ func (h *hub) Event(e model.Event) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	h.connected = true
-
 	// Stats FIRST and unconditionally: they are fed at ingest and never derived
 	// from the cache, so they stay correct after eviction (spec §5.4,
 	// invariant 3). e.Arrival, never e.Stamp — a minion with a skewed clock must
@@ -391,12 +389,31 @@ func clampLabel(s string) string {
 }
 
 // Gap implements saltipc.Sink.
+//
+// It does NOT touch h.connected. Reader.Run closes an outage window by calling
+// Gap on the RECONNECT path, so clearing the flag here made the one call that
+// means "we are back" the call that said "we are gone". Connectedness comes
+// from Attached and from nowhere else.
 func (h *hub) Gap(from, to time.Time) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	h.connected = false
 	h.rings.MarkGap(from, to)
+}
+
+// Attached implements saltipc.Sink: the reader tells us whether it holds the
+// publish socket, and that is the ONLY source of the status bar's connection
+// state.
+//
+// Deriving it from event arrival instead — which is what this did — made a
+// healthy but quiet master read DISCONNECTED in capitals until the first event
+// landed. Spec §8.2 is about an outage not rendering as a quiet master; this
+// was the inverse, and during an incident it is worse.
+func (h *hub) Attached(attached bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.connected = attached
 }
 
 // DecodeError implements saltipc.Sink.
@@ -435,12 +452,14 @@ func (h *hub) Snapshot(q filter.Query, limit int) ui.Snapshot {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
+	events, scanned := h.cache.Snapshot(q, limit)
+
 	return ui.Snapshot{
 		// The snapshot's clock reading is the SAME clock the reader stamps
 		// arrival with, so a duration computed between the two is meaningful.
 		// Never _stamp (invariant 2).
 		Now:           h.clock.Now(),
-		Events:        h.cache.Snapshot(q, limit),
+		Events:        events,
 		Cache:         h.cache.Stats(),
 		Seconds:       h.rings.Seconds(),
 		Minutes:       h.rings.Minutes(),
@@ -452,6 +471,7 @@ func (h *hub) Snapshot(q filter.Query, limit int) ui.Snapshot {
 		Jobs:          h.jobList(),
 		JobStats:      h.jobs.Stats(),
 		JobLookup:     h.lookupJob,
+		Scanned:       scanned,
 		Query:         q,
 		Connected:     h.connected,
 		DecodeErrors:  h.decodeErrors,
@@ -513,19 +533,33 @@ func (h *hub) lookupJob(jid string) (*model.Job, stats.Lookup) {
 
 // AllEvents returns everything retained that matches q, for export.
 //
-// It copies under the lock and the exporter then streams from that copy, so a
-// multi-hundred-megabyte write never holds up ingest (spec §10.3).
+// # What holds the ingest lock, exactly
+//
+// Only the copy. The exporter's decode, marshal and write — the
+// multi-hundred-megabyte part — run from the returned slice with nothing held
+// (spec §10.3), and so does the filtering, which used to be inside the lock
+// and cost more than the copy did.
+//
+// The copy itself is O(retained) and there is no honest way around that: an
+// export is of the whole retained set by definition, and the alternative —
+// releasing the lock between chunks — would hand the operator a torn file
+// spanning several instants rather than one. Measured at ~13 ms for 500,000
+// retained events, scaling linearly with --max-memory. Unlike Snapshot, which
+// pays its cost ten times a second forever, this is one operator keystroke,
+// and the kernel's socket buffer absorbs a pause of that length. That is the
+// trade; it is written down here rather than claimed away, because the earlier
+// version of this comment said a big write "never holds up ingest" — true of
+// the write, false of the copy, which is the expensive half.
 func (h *hub) AllEvents(q filter.Query) []model.Event {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	all := h.cache.All()
+	all := h.copyAll()
 
 	if q.IsZero() {
 		return all
 	}
 
-	out := make([]model.Event, 0, len(all))
+	// Filtered in place: the slice is already ours alone, and writing behind
+	// the read cursor cannot overtake it.
+	out := all[:0]
 
 	for _, e := range all {
 		if q.Match(e) {
@@ -534,4 +568,13 @@ func (h *hub) AllEvents(q filter.Query) []model.Event {
 	}
 
 	return out
+}
+
+// copyAll takes the whole retained set under the lock and nothing else, so the
+// hold is one memmove rather than a memmove plus a match per event.
+func (h *hub) copyAll() []model.Event {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	return h.cache.All()
 }

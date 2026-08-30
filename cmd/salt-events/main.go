@@ -70,7 +70,7 @@ func run() error {
 	sockPath := config.SocketPath(cfg.SockDir)
 
 	if capture.frames > 0 {
-		return captureFrames(sockPath, capture.out, capture.frames)
+		return captureFrames(cfg.SockDir, capture.out, capture.frames)
 	}
 
 	query, err := filter.Parse(cfg.Filter)
@@ -104,10 +104,6 @@ func serve(cfg config.Config, query filter.Query, sockPath string) error {
 	// is not the caller's to give (invariant 1).
 	reader := saltipc.NewReader(cfg.SockDir, clock.Now)
 
-	readErr := make(chan error, 1)
-
-	go func() { readErr <- reader.Run(ctx, h) }()
-
 	program := tea.NewProgram(
 		ui.NewModel(h, panesFor(), ui.Options{
 			Theme:      themeName(cfg),
@@ -121,6 +117,20 @@ func serve(cfg config.Config, query filter.Query, sockPath string) error {
 		tea.WithContext(ctx),
 	)
 
+	readErr := make(chan error, 1)
+
+	// The program is built BEFORE the reader starts so a reader that dies on
+	// its first dial has somewhere to say so. Run returns permanently on a
+	// first-dial failure, so without this the console sits there showing
+	// nothing but DISCONNECTED and the reason is printed only once the
+	// operator gives up and quits (spec §8.1).
+	go func() {
+		err := reader.Run(ctx, h)
+		readErr <- err
+
+		reportReaderFailure(program, sockPath, err)
+	}()
+
 	if _, err := program.Run(); err != nil && !killedBySignal(ctx, err) {
 		return fmt.Errorf("run TUI: %w", err)
 	}
@@ -133,12 +143,41 @@ func serve(cfg config.Config, query filter.Query, sockPath string) error {
 	select {
 	case err := <-readErr:
 		if err != nil {
-			return fmt.Errorf("event reader: %w", err)
+			// Through Diagnose, not wrapped raw: "connect: permission denied"
+			// makes the operator guess, and this is the same instruction the
+			// TUI has already been showing.
+			return errors.New(saltipc.Diagnose(sockPath, err))
 		}
 	default:
 	}
 
 	return nil
+}
+
+// sender is the half of *tea.Program this file needs to hand a message to a
+// running TUI. It is an interface so the reader-failure path is testable
+// without standing up a terminal.
+type sender interface {
+	Send(tea.Msg)
+}
+
+// reportReaderFailure tells the running TUI why the reader stopped, as §8.1's
+// instruction rather than as an errno.
+//
+// A nil error is a clean shutdown and says nothing. Anything else is
+// permanent: Reader.Run only returns on cancellation or on a failure it will
+// never retry, so the console from here on is showing history and the operator
+// has to be told while they are still looking at it.
+//
+// Send blocks until the program's event loop takes the message, and returns
+// immediately once the program's context is done — so this cannot outlive the
+// TUI or wedge shutdown.
+func reportReaderFailure(p sender, sockPath string, err error) {
+	if err == nil {
+		return
+	}
+
+	p.Send(ui.ReaderErrorMsg(saltipc.Diagnose(sockPath, err)))
 }
 
 // killedBySignal reports whether the program ended because the process was
@@ -196,8 +235,12 @@ func exporter(cfg config.Config, h *hub) ui.ExportFunc {
 			Space: export.NewStatfsChecker(),
 			// Under sudo the file would otherwise be root-owned and unreadable
 			// by the operator who asked for it (spec §10.1).
-			Chown:  export.ChownToSudoUser(os.Getenv),
-			Decode: jsonSafeDecode,
+			Chown: export.ChownToSudoUser(os.Getenv),
+			// The RAW decoder — the same one the Detail pane gets.
+			// internal/export applies its own JSON-safety pass to whatever
+			// comes back, so there is ONE decoder at this seam rather than two
+			// (see export.Options.Decode).
+			Decode: saltipc.DecodeValue,
 		})
 
 		// A failed chown is the one case that returns both: the export IS on
@@ -213,74 +256,6 @@ func exporter(cfg config.Config, h *hub) ui.ExportFunc {
 		}
 
 		return fmt.Sprintf("wrote %d events (%d bytes) to %s", res.Events, res.Bytes, res.Path), nil
-	}
-}
-
-// maxJSONDepth bounds how deep jsonSafe recurses.
-//
-// A payload is minion-supplied and can legally be a megabyte of nothing but
-// nested one-element maps, which is hundreds of thousands of levels — enough to
-// overflow the goroutine stack. "Never panic on bus data" makes this a bound,
-// not a comment. It matches internal/ui/detail's identical bound, for the same
-// reason.
-const maxJSONDepth = 32
-
-// jsonSafeDecode is the decoder handed to the EXPORTER, as distinct from the
-// one handed to the Detail pane.
-//
-// They need different shapes and that is the wiring layer's problem to solve,
-// which is precisely why both take an injected decoder. saltipc.DecodeValue
-// sets DecodeUntypedMap, so every map it returns is a
-// map[interface{}]interface{} — the shape the Detail pane's renderer wants, and
-// the one encoding/json refuses outright ("unsupported type"). Handing the raw
-// decoder to the exporter makes `w` fail on every event carrying a map, which
-// is every real event off the bus.
-func jsonSafeDecode(payload []byte) (any, error) {
-	v, err := saltipc.DecodeValue(payload)
-	if err != nil {
-		return nil, err
-	}
-
-	return jsonSafe(v, 0), nil
-}
-
-// jsonSafe rewrites a decoded payload into something encoding/json can marshal.
-//
-// Keys are stringified rather than asserted to string: msgpack permits any type
-// as a map key, and one event captured off a live master carried a top-level
-// key with spaces in it, so nothing here may assume an identifier shape.
-func jsonSafe(v any, depth int) any {
-	if depth > maxJSONDepth {
-		return "…(nested too deeply to export)"
-	}
-
-	switch t := v.(type) {
-	case map[interface{}]interface{}:
-		out := make(map[string]any, len(t))
-		for key, val := range t {
-			out[fmt.Sprint(key)] = jsonSafe(val, depth+1)
-		}
-
-		return out
-
-	case map[string]interface{}:
-		out := make(map[string]any, len(t))
-		for key, val := range t {
-			out[key] = jsonSafe(val, depth+1)
-		}
-
-		return out
-
-	case []interface{}:
-		out := make([]any, len(t))
-		for i, item := range t {
-			out[i] = jsonSafe(item, depth+1)
-		}
-
-		return out
-
-	default:
-		return v
 	}
 }
 

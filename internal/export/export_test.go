@@ -2,8 +2,10 @@ package export_test
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -929,5 +931,176 @@ func TestStatfsCheckerReportsAMissingDirectory(t *testing.T) {
 	_, _, err := export.NewStatfsChecker().Available(filepath.Join(t.TempDir(), "absent"))
 	if err == nil {
 		t.Error("expected an error statfs-ing a missing directory")
+	}
+}
+
+// decodedPayload reads back the payload of the single record in the export
+// written by opts, so a test can assert on what encoding/json actually
+// produced rather than on the fact that Write returned nil.
+func decodedPayload(t *testing.T, path string) map[string]any {
+	t.Helper()
+
+	raw, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		t.Fatalf("read export: %v", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("want exactly one NDJSON line, got %d", len(lines))
+	}
+
+	var rec struct {
+		Payload map[string]any `json:"payload"`
+	}
+
+	if err := json.Unmarshal([]byte(lines[0]), &rec); err != nil {
+		t.Fatalf("the export is not valid NDJSON: %v\nline: %s", err, lines[0])
+	}
+
+	return rec.Payload
+}
+
+// TestWriteRewritesTheDecodersOutputIntoJSONSafeValues is the guarantee this
+// package owes every caller: it requires JSON-safe input, so it is the package
+// that must produce it.
+//
+// saltipc.DecodeValue sets DecodeUntypedMap, so EVERY map off the real bus —
+// at every nesting level — is a map[interface{}]interface{}, which
+// encoding/json refuses outright. A caller that hands over the raw decoder
+// must still get a valid export; requiring each caller to remember to wrap it
+// is what re-arms this bug on the next one.
+func TestWriteRewritesTheDecodersOutputIntoJSONSafeValues(t *testing.T) {
+	t.Parallel()
+
+	opts := roomyOpts(t)
+	opts.Decode = func([]byte) (any, error) {
+		return map[interface{}]interface{}{
+			// A non-identifier top-level key, as captured off a live master.
+			"pkg_|-install_|-nginx_|-installed": map[interface{}]interface{}{
+				"result":  true,
+				"changes": map[interface{}]interface{}{"nginx": "1.24"},
+			},
+			// A non-string key: msgpack permits any type as a map key.
+			7: "seven",
+			"list": []interface{}{
+				"scalar",
+				map[interface{}]interface{}{"nested": "deeper"},
+			},
+		}, nil
+	}
+
+	res, err := export.Write(events(1, 10), opts)
+	if err != nil {
+		t.Fatalf("Write with a real-shaped decoder: %v", err)
+	}
+
+	payload := decodedPayload(t, res.Path)
+
+	state, ok := payload["pkg_|-install_|-nginx_|-installed"].(map[string]any)
+	if !ok {
+		t.Fatalf("the non-identifier top-level key did not round-trip: %#v", payload)
+	}
+
+	changes, ok := state["changes"].(map[string]any)
+	if !ok || changes["nginx"] != "1.24" {
+		t.Errorf("the nested interface-keyed map did not round-trip: %#v", state)
+	}
+
+	if payload["7"] != "seven" {
+		t.Errorf("a non-string map key did not round-trip as text: %#v", payload)
+	}
+
+	list, ok := payload["list"].([]any)
+	if !ok || len(list) != 2 {
+		t.Fatalf("the list did not round-trip: %#v", payload["list"])
+	}
+
+	item, ok := list[1].(map[string]any)
+	if !ok || item["nested"] != "deeper" {
+		t.Errorf("a map inside a list did not round-trip: %#v", list[1])
+	}
+}
+
+// TestWriteSurvivesANonFiniteFloat pins the failure that took a whole export
+// down: one NaN anywhere in any retained payload made encoding/json refuse the
+// record, stream() return on the first error, and writeFile unlink the
+// .partial — so the operator got nothing at all, not the other events.
+func TestWriteSurvivesANonFiniteFloat(t *testing.T) {
+	t.Parallel()
+
+	opts := roomyOpts(t)
+	opts.Decode = func([]byte) (any, error) {
+		return map[interface{}]interface{}{
+			"nan":      math.NaN(),
+			"pos_inf":  math.Inf(1),
+			"neg_inf":  math.Inf(-1),
+			"finite":   1.5,
+			"nan32":    float32(math.NaN()),
+			"nested":   map[interface{}]interface{}{"also": math.NaN()},
+			"in_list":  []interface{}{math.Inf(1)},
+			"ordinary": "text",
+		}, nil
+	}
+
+	res, err := export.Write(events(1, 10), opts)
+	if err != nil {
+		t.Fatalf("Write with a non-finite float in the payload: %v", err)
+	}
+
+	payload := decodedPayload(t, res.Path)
+
+	for key, want := range map[string]any{
+		"nan":      "NaN",
+		"pos_inf":  "+Inf",
+		"neg_inf":  "-Inf",
+		"nan32":    "NaN",
+		"finite":   1.5,
+		"ordinary": "text",
+	} {
+		if got := payload[key]; got != want {
+			t.Errorf("payload[%q] = %#v, want %#v", key, got, want)
+		}
+	}
+
+	nested, ok := payload["nested"].(map[string]any)
+	if !ok || nested["also"] != "NaN" {
+		t.Errorf("a non-finite float nested in a map was not neutralised: %#v", payload["nested"])
+	}
+
+	list, ok := payload["in_list"].([]any)
+	if !ok || len(list) != 1 || list[0] != "+Inf" {
+		t.Errorf("a non-finite float inside a list was not neutralised: %#v", payload["in_list"])
+	}
+}
+
+// TestWriteBoundsHowDeeplyAPayloadMayNest keeps a hostile payload from
+// overflowing the goroutine stack. A payload is minion-supplied and can
+// legally be a megabyte of nothing but nested one-element maps.
+func TestWriteBoundsHowDeeplyAPayloadMayNest(t *testing.T) {
+	t.Parallel()
+
+	const depth = 5000
+
+	var deep any = "bottom"
+	for range depth {
+		deep = map[interface{}]interface{}{"d": deep}
+	}
+
+	opts := roomyOpts(t)
+	opts.Decode = func([]byte) (any, error) { return deep, nil }
+
+	res, err := export.Write(events(1, 10), opts)
+	if err != nil {
+		t.Fatalf("Write with a %d-deep payload: %v", depth, err)
+	}
+
+	raw, err := os.ReadFile(filepath.Clean(res.Path))
+	if err != nil {
+		t.Fatalf("read export: %v", err)
+	}
+
+	if !strings.Contains(string(raw), "nested too deeply to export") {
+		t.Error("a payload past the depth bound must be rendered as a sentinel, not silently truncated")
 	}
 }

@@ -241,22 +241,50 @@ func TestSnapshotJobsAreNotAliasedIntoTheIndex(t *testing.T) {
 	}
 }
 
-func TestHubTracksConnectionState(t *testing.T) {
+// TestHubTakesConnectionStateFromTheReaderAndNowhereElse pins where the status
+// bar's connectedness comes from.
+//
+// It used to be inferred: set by Event, cleared by Gap. Both halves were
+// wrong. A quiet master read DISCONNECTED because no event had arrived yet,
+// and a SUCCESSFUL reconnect read DISCONNECTED because Reader.Run closes the
+// outage window by calling Gap. Each assertion below fails against that
+// inference and passes against the socket-derived state.
+func TestHubTakesConnectionStateFromTheReaderAndNowhereElse(t *testing.T) {
 	t.Parallel()
 
 	h := newHub(hubConfig{MaxMemory: 1 << 20, MaxJobs: 100, Clock: stats.RealClock{}})
 
-	h.Event(model.Event{Arrival: time.Now(), Tag: "salt/auth"})
-
-	if !h.Snapshot(filter.Query{}, 10).Connected {
-		t.Error("Connected = false after an event arrived")
+	if h.Snapshot(filter.Query{}, 10).Connected {
+		t.Error("a hub that has never been attached reports Connected")
 	}
 
+	// An event is not evidence of connectedness on its own — but nor may it
+	// destroy it. The reader is the only authority.
+	h.Event(model.Event{Arrival: time.Now(), Tag: "salt/auth"})
+
+	if h.Snapshot(filter.Query{}, 10).Connected {
+		t.Error("Connected = true from event arrival alone; it must come from the socket")
+	}
+
+	h.Attached(true)
+
+	if !h.Snapshot(filter.Query{}, 10).Connected {
+		t.Error("Connected = false while the reader holds the socket")
+	}
+
+	// The call that CLOSES an outage window must not read as an outage.
 	now := time.Now()
 	h.Gap(now.Add(-time.Second), now)
 
+	if !h.Snapshot(filter.Query{}, 10).Connected {
+		t.Error("a Gap report cleared Connected; Run closes an outage by calling Gap, " +
+			"so this makes a successful reconnect read as a disconnection")
+	}
+
+	h.Attached(false)
+
 	if h.Snapshot(filter.Query{}, 10).Connected {
-		t.Error("Connected = true after a gap was reported")
+		t.Error("Connected = true after the reader reported it lost the socket")
 	}
 }
 
@@ -710,5 +738,88 @@ func TestTheJobCopyCacheStaysBoundedWhileNothingSnapshots(t *testing.T) {
 
 	if len(snap.Jobs) > 0 && snap.Jobs[0].Fun != "test.ping" {
 		t.Errorf("the newest listed job is %+v, want a test.ping", snap.Jobs[0])
+	}
+}
+
+// benchHub fills a hub with n events through the real ingest path.
+func benchHub(b *testing.B, n int) *hub {
+	b.Helper()
+
+	h := newHub(hubConfig{
+		MaxMemory: 1 << 30, MaxJobs: 500,
+		Clock: stats.NewFakeClock(start), Decode: saltipc.DecodeValue,
+	})
+
+	fake := saltipc.NewFake(start)
+
+	for i := range n {
+		if err := fake.FeedData(h, fmt.Sprintf("salt/minion/web-%d/start", i%1000),
+			map[string]any{"id": fmt.Sprintf("web-%d", i%1000)}); err != nil {
+			b.Fatalf("feed: %v", err)
+		}
+	}
+
+	return h
+}
+
+// BenchmarkHubSnapshotHoldsTheIngestLock measures the thing invariant 6 is
+// actually about: hub.Snapshot runs entirely under h.mu, so its wall time IS
+// the time the reader goroutine is blocked, ten times a second.
+//
+// The selective case is the one that matters. It used to walk the whole ring
+// looking for matches it would never find — 22.1 ms per tick on a full default
+// 256 MiB cache, and linear in --max-memory beyond that. Run both sizes: a
+// regression shows up as the selective case growing with the cache while the
+// unfiltered one does not.
+func BenchmarkHubSnapshotHoldsTheIngestLock(b *testing.B) {
+	for _, events := range []int{50_000, 500_000} {
+		h := benchHub(b, events)
+
+		b.Run(fmt.Sprintf("%d-events/unfiltered", events), func(b *testing.B) {
+			for range b.N {
+				h.Snapshot(filter.Query{}, 2000)
+			}
+		})
+
+		q, err := filter.Parse("minion:no-such-minion")
+		if err != nil {
+			b.Fatalf("Parse: %v", err)
+		}
+
+		b.Run(fmt.Sprintf("%d-events/selective", events), func(b *testing.B) {
+			for range b.N {
+				h.Snapshot(q, 2000)
+			}
+		})
+	}
+}
+
+// BenchmarkHubExportHoldsTheIngestLockOnlyForTheCopy separates the export
+// path's two costs.
+//
+// copyAll is the part that runs under h.mu, so its time is the ingest stall.
+// AllEvents is copy PLUS the match of every retained event, and the matching
+// used to be inside the lock too — which is why the hold was several times the
+// copy. A regression that moves it back shows up as the two rows converging.
+func BenchmarkHubExportHoldsTheIngestLockOnlyForTheCopy(b *testing.B) {
+	for _, events := range []int{50_000, 500_000} {
+		h := benchHub(b, events)
+
+		q, err := filter.Parse("minion:no-such-minion")
+		if err != nil {
+			b.Fatalf("Parse: %v", err)
+		}
+
+		b.Run(fmt.Sprintf("%d-events/lock-held", events), func(b *testing.B) {
+			for range b.N {
+				h.copyAll()
+			}
+		})
+
+		b.Run(fmt.Sprintf("%d-events/whole-call", events), func(b *testing.B) {
+			for range b.N {
+				h.AllEvents(q)
+			}
+		})
 	}
 }

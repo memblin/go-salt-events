@@ -54,6 +54,25 @@ type OpenJobReturnMsg struct {
 // belongs in a pane's own body.
 type NoticeMsg string
 
+// ReaderErrorMsg carries the reason the event reader stopped, already turned
+// into an instruction by the wiring layer (spec §8.1).
+//
+// It is separate from NoticeMsg and deliberately so. A notice is transient and
+// is cleared by the next keystroke; this is not — the reader does not come
+// back, and until it is dismissed the console is showing history rather than a
+// live bus, which the operator must be told. It is also multi-line, because
+// the whole value of §8.1's diagnostics is the remedy underneath the cause:
+// "permission denied" alone makes the operator guess, and `sudo salt-events`
+// under it turns the screen into a single read.
+//
+// Without it the two most common first-run failures — forgetting sudo, and a
+// master mid-restart — produced nothing on screen but DISCONNECTED, and the
+// reason was printed only after the operator gave up and quit.
+//
+// The wiring layer builds the text with saltipc.Diagnose; internal/ui must not
+// import the ingest layer (spec §3.1) and so is handed the finished string.
+type ReaderErrorMsg string
+
 // snapshotLimit bounds how many events a snapshot carries. The Live pane can
 // only show a screenful; copying the whole cache every tick would make render
 // cost scale with cache size rather than viewport size.

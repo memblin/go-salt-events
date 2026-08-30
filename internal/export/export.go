@@ -97,8 +97,14 @@ type Options struct {
 	// Chown hands the finished file to the invoking user. Optional.
 	Chown func(path string) error
 
-	// Decode turns a raw msgpack payload into something json can marshal.
-	// Injected so this package never imports a msgpack library (spec §3.1).
+	// Decode turns a raw payload into a Go value. Injected so this package
+	// never imports a msgpack library (spec §3.1).
+	//
+	// It does NOT have to return something encoding/json can marshal: whatever
+	// it returns is passed through jsonSafe before it is encoded, so a caller
+	// may hand over the same raw decoder every other consumer gets. That is
+	// deliberate — requiring each caller to wrap its decoder is what re-arms
+	// the "unsupported type" bug on the next one.
 	Decode func([]byte) (any, error)
 }
 
@@ -373,7 +379,11 @@ func encode(e model.Event, decode func([]byte) (any, error)) ([]byte, error) {
 			return nil, fmt.Errorf("decode payload for %s: %w", e.Tag, err)
 		}
 
-		rec.Payload = v
+		// The injected decoder returns whatever the wire format decodes to,
+		// which encoding/json refuses for most real payloads. Neutralising it
+		// HERE is what makes the guarantee a property of this package rather
+		// than a step each caller must remember — see jsonSafe.
+		rec.Payload = jsonSafe(v, 0)
 	}
 
 	line, err := json.Marshal(rec)
