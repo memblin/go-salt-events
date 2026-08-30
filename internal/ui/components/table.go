@@ -3,17 +3,12 @@ package components
 import (
 	"strings"
 
-	"github.com/charmbracelet/lipgloss"
-
 	"github.com/TKC-Labs/go-salt-events/internal/theme"
 )
 
 // NoSelection means no row is highlighted. It is negative so it can never
 // collide with a real row index.
 const NoSelection = -1
-
-// controlGlyph stands in for a control character in cell text.
-const controlGlyph = '·'
 
 // Column is one table column. Exactly one column should set Flex; it absorbs
 // the leftover width. If several do, the last one wins.
@@ -131,56 +126,12 @@ func shrink(widths []int, fixed *int, avail int) {
 	}
 }
 
-// pad renders s into exactly w display cells, truncating or right-padding.
-func pad(s string, w int) string {
-	if w <= 0 {
-		return ""
-	}
-
-	s = sanitise(s)
-
-	if lipgloss.Width(s) > w {
-		s = lipgloss.NewStyle().MaxWidth(w).Render(s)
-	}
-
-	if gap := w - lipgloss.Width(s); gap > 0 {
-		return s + strings.Repeat(" ", gap)
-	}
-
-	return s
-}
-
-// sanitise replaces control characters with a visible placeholder.
+// pad renders one cell into exactly w display cells.
 //
-// Tags and payload previews arrive from the bus. A newline would split one
-// table row across two lines and desynchronise every pane laid out beside it;
-// a raw ESC would let event data drive the operator's terminal — move the
-// cursor, set the window title, repaint the screen. Neither is acceptable in a
-// tool that runs as root on a production master, so control runes are replaced
-// rather than trusted. A tab is included: its display width depends on the
-// terminal's stops, so it cannot be measured and would break width-exactness.
-func sanitise(s string) string {
-	if !strings.ContainsFunc(s, isControl) {
-		return s
-	}
-
-	return strings.Map(func(r rune) rune {
-		if isControl(r) {
-			return controlGlyph
-		}
-
-		return r
-	}, s)
-}
-
-// isControl reports whether r is a C0 control, DEL, or a C1 control.
-func isControl(r rune) bool {
-	const (
-		space = 0x20
-		del   = 0x7f
-		c1Lo  = 0x80
-		c1Hi  = 0x9f
-	)
-
-	return r < space || r == del || (r >= c1Lo && r <= c1Hi)
+// Cell text is bus-derived, so it is sanitised before it is measured (see
+// Sanitise in text.go). The cut carries no Ellipsis marker on purpose: a table
+// column boundary is itself the visual cue that a value continues, which a
+// free-form ranked row does not have.
+func pad(s string, w int) string {
+	return PadTo(Sanitise(s), w)
 }
