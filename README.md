@@ -33,8 +33,13 @@ sudo salt-events
 ## Install
 
 Packages are attached to each [release](https://git.tkclabs.io/TKC-Labs/go-salt-events/releases),
-for `linux/amd64` and `linux/arm64`. The binaries are statically linked, so they
-carry no glibc dependency and a package built on one host installs on another.
+for `linux/amd64`. The binaries are statically linked, so they carry no glibc
+dependency and a package built on one host installs on another.
+
+Only `amd64` is published. The build cross-compiles cleanly to `arm64`, but no
+runner here can execute an `arm64` binary, and shipping an artefact that has
+never been run on its target architecture is a guess rather than a release.
+Build it yourself with `just build-release linux arm64` if you need one.
 
 ```bash
 # RPM (AlmaLinux, Rocky, RHEL, Fedora)
