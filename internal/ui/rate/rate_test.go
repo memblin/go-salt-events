@@ -229,6 +229,128 @@ func TestRateFitsItsBox(t *testing.T) {
 	}
 }
 
+// TestRateSanitisesBusSuppliedKeys asserts against the RAW output, never
+// against ansi.Strip(got).
+//
+// Stripping first is the mistake that made the sibling Jobs test toothless:
+// ansi.Strip removes well-formed CSI sequences, so an assertion applied to a
+// stripped view is checking that a MALFORMED escape survived — precisely the
+// case an attacker would not send. The top-N keys here are stats.Entry keys
+// from Snapshot.TopCategories / TopMinions, which is to say a tag or minion ID
+// a minion can set to anything at all via event.send, and this tool is expected
+// to run as root on a production master.
+func TestRateSanitisesBusSuppliedKeys(t *testing.T) {
+	t.Parallel()
+
+	s := ui.Snapshot{
+		TopCategories: []stats.Entry{
+			{Key: "salt/\x1b]0;pwned\x07job", Count: 10, Pct: 50},
+			{Key: "tab\there", Count: 5, Pct: 25},
+		},
+		TopMinions: []stats.Entry{{Key: "web\x1b[2Jok", Count: 3, Pct: 15}},
+	}
+
+	got := rate.New().View(100, 30, s, styles(t))
+
+	// "\x1b[2J" cannot be confused with this pane's own styling: SGR sequences
+	// terminate in "m", never in "J".
+	for _, bad := range []string{"\x1b]0;", "\x1b[2J", "\x07", "\t"} {
+		if strings.Contains(got, bad) {
+			t.Errorf("control sequence %q reached the terminal:\n%q", bad, got)
+		}
+	}
+}
+
+// TestRateHeightClampSurvivesANewlineInATag is the second half of the same
+// defect and is a frame bug rather than a security one.
+//
+// View clamps its line COUNT to h and then fits each line to w, but a key
+// containing newlines is a single element of that slice which renders as
+// several terminal rows — lipgloss MaxWidth applies per line rather than
+// collapsing them. Since the root's frame is Height(contentH) and lipgloss
+// Height is a MINIMUM, the overflow grows the frame and pushes the filter bar,
+// hint line and status bar off the bottom of the terminal.
+func TestRateHeightClampSurvivesANewlineInATag(t *testing.T) {
+	t.Parallel()
+
+	s := ui.Snapshot{
+		TopMinions: []stats.Entry{{Key: "a\nb\nc\nd\ne\nf\ng\nh", Count: 1, Pct: 100}},
+	}
+
+	st := styles(t)
+
+	for _, h := range []int{3, 6, 10, 24} {
+		got := rate.New().View(100, h, s, st)
+
+		if lines := strings.Count(got, "\n") + 1; lines > h {
+			t.Errorf("h=%d: emitted %d lines, which grows the root's frame:\n%q", h, lines, got)
+		}
+	}
+}
+
+// TestRateNamesTheEmptyKeyTheSameWayTheSummaryPaneDoes.
+//
+// Rate and Summary render the SAME Snapshot.TopCategories / TopMinions slices,
+// and an operator compares the two screens. An empty Category is the master's
+// bare-JID publish-ack and is roughly a fifth of real traffic, so a blank label
+// here is not an edge case — it is the single most frequent class in the
+// breakdown, rendered as a bar and a percentage attached to nothing.
+func TestRateNamesTheEmptyKeyTheSameWayTheSummaryPaneDoes(t *testing.T) {
+	t.Parallel()
+
+	s := ui.Snapshot{
+		TopCategories: []stats.Entry{{Key: "", Count: 19, Pct: 19}},
+		TopMinions:    []stats.Entry{{Key: "", Count: 3, Pct: 3}},
+	}
+
+	got := ansi.Strip(rate.New().View(100, 24, s, styles(t)))
+
+	for _, want := range []string{"(master job publish-ack)", "(none)"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("want %q in:\n%s", want, got)
+		}
+	}
+
+	if strings.Contains(got, "*") {
+		t.Errorf("an empty key must not be shown as a wildcard:\n%s", got)
+	}
+
+	// The general form of the rule: whatever produced the empty key, a bar and
+	// a percentage attached to nothing carry no identity at all (spec §9).
+	for _, line := range strings.Split(got, "\n") {
+		i := strings.IndexAny(line, "█░")
+		if i < 0 {
+			continue
+		}
+
+		if strings.TrimSpace(line[:i]) == "" {
+			t.Errorf("ranked row has a blank label: %q", line)
+		}
+	}
+}
+
+// TestRateMarksATruncatedTag: a tag cut with no marker reads as a real tag that
+// genuinely ends there. Summary marks the identical key from the identical
+// slice with "…", so an unmarked cut here is also two panes disagreeing about
+// one string.
+func TestRateMarksATruncatedTag(t *testing.T) {
+	t.Parallel()
+
+	const long = "salt/job/20260830081402123456/ret/web-server-01.datacentre1.example.com"
+
+	s := ui.Snapshot{TopCategories: []stats.Entry{{Key: long, Count: 1, Pct: 100}}}
+
+	got := ansi.Strip(rate.New().View(100, 24, s, styles(t)))
+
+	if strings.Contains(got, long) {
+		t.Fatalf("the tag was not truncated at all, so there is nothing to mark:\n%s", got)
+	}
+
+	if !strings.Contains(got, "…") {
+		t.Errorf("a truncated tag carries no visible marker:\n%s", got)
+	}
+}
+
 // TestRateNeverPanics covers the two states the contract calls out: a content
 // box as small as 1x1 during a resize, and a Snapshot whose slices are all nil
 // before the first tick.

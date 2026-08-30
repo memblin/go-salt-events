@@ -22,7 +22,6 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 
 	"github.com/TKC-Labs/go-salt-events/internal/model"
 	"github.com/TKC-Labs/go-salt-events/internal/stats"
@@ -204,7 +203,7 @@ func (p *Pane) viewList(w, h int, s ui.Snapshot, st *theme.Styles) string {
 	head := indexHeader(s.JobStats, st)
 
 	if len(s.Jobs) == 0 {
-		return clamp([]string{head, st.Muted.Render("no jobs seen yet")}, h)
+		return clamp([]string{head, st.Muted.Render("no jobs seen yet")}, w, h)
 	}
 
 	// Jobs are evicted between frames, so the cursor is re-clamped here
@@ -230,7 +229,7 @@ func (p *Pane) viewList(w, h int, s ui.Snapshot, st *theme.Styles) string {
 	}
 
 	return clamp(append([]string{head}, components.RenderTable(
-		listColumns, rows, cursor-start, w, st)...), h)
+		listColumns, rows, cursor-start, w, st)...), w, h)
 }
 
 // indexHeader reports occupancy and evictions.
@@ -329,7 +328,7 @@ func (p *Pane) viewDrilled(w, h int, s ui.Snapshot, st *theme.Styles) string {
 	// JobLookup is nil before the first tick (see ui.Snapshot). A pane that
 	// called it anyway would panic on the resize that arrives first.
 	if s.JobLookup == nil {
-		return clamp([]string{st.Muted.Render("waiting for the first snapshot")}, h)
+		return clamp([]string{st.Muted.Render("waiting for the first snapshot")}, w, h)
 	}
 
 	job, lookup := s.JobLookup(p.drilled)
@@ -340,16 +339,16 @@ func (p *Pane) viewDrilled(w, h int, s ui.Snapshot, st *theme.Styles) string {
 	if lookup == stats.LookupEvicted {
 		return clamp([]string{st.Warn.Render(fit(
 			"job "+p.drilled+" was evicted from the job index — raise --max-jobs to retain more",
-			w))}, h)
+			w))}, w, h)
 	}
 
 	if lookup != stats.LookupFound || job == nil {
 		return clamp([]string{st.Muted.Render(fit(
 			"job "+p.drilled+" was never seen on the bus — attach sooner to catch its job/new event",
-			w))}, h)
+			w))}, w, h)
 	}
 
-	return clamp(p.drillLines(w, h, job, st), h)
+	return clamp(p.drillLines(w, h, job, st), w, h)
 }
 
 // drillLines assembles the drill-down, chrome first and then the visible slice
@@ -521,8 +520,23 @@ func scrollStart(cursor, window, n int) int {
 	return min(cursor-window+1, max(0, n-window))
 }
 
-// clamp joins at most h lines.
-func clamp(lines []string, h int) string {
+// clamp fits every line to w cells and joins at most h of them.
+//
+// The WIDTH pass is not decoration. Three lines here — the index header, the
+// empty-list message and the drill-down counts — are composed at a fixed
+// natural width (70, 16 and 49 cells) with no reference to the box at all, and
+// an over-long line is not merely clipped by the root: lipgloss word-WRAPS it,
+// and because the root's frame is Height(contentH) and lipgloss Height is a
+// MINIMUM, the frame grows a row per wrap and pushes the status bar off the
+// bottom of the terminal. Doing it once, here, is also why a fourth such line
+// cannot be added without being fitted — every path out of View goes through
+// this function. The other four panes each run the same last-step pass.
+//
+// components.Fit rather than this package's fit: these lines are already
+// STYLED, and sanitising them would replace the ESC introducing each SGR
+// sequence and print the escape codes as literal garbage. Bus-derived text is
+// sanitised earlier, on its way in, by fit and by components.RenderTable.
+func clamp(lines []string, w, h int) string {
 	if h < 0 {
 		h = 0
 	}
@@ -531,67 +545,28 @@ func clamp(lines []string, h int) string {
 		lines = lines[:h]
 	}
 
+	for i, l := range lines {
+		lines[i] = components.Fit(l, w)
+	}
+
 	return strings.Join(lines, "\n")
 }
 
 // cell renders s into exactly w display cells.
-func cell(s string, w int) string {
-	s = fit(s, w)
+func cell(s string, w int) string { return components.PadTo(fit(s, w), w) }
 
-	if gap := w - lipgloss.Width(s); gap > 0 {
-		return s + strings.Repeat(" ", gap)
-	}
-
-	return s
-}
-
-// fit sanitises s and truncates it to at most w display cells.
-func fit(s string, w int) string {
-	if w <= 0 {
-		return ""
-	}
-
-	s = sanitise(s)
-
-	if lipgloss.Width(s) > w {
-		return lipgloss.NewStyle().MaxWidth(w).Render(s)
-	}
-
-	return s
-}
-
-// controlGlyph stands in for a control character.
-const controlGlyph = '·'
-
-// sanitise replaces control characters with a visible placeholder.
+// fit sanitises UNSTYLED, bus-derived text and truncates it to at most w
+// display cells.
 //
-// Minion IDs and function names come off the bus and are minion-supplied. A
-// newline here would split one row across two lines and desynchronise the
-// frame; a raw ESC would let event data drive the operator's terminal. The
-// table primitive does this for the list view, but the drill-down renders its
-// rows itself in order to colour them per status, so it must do it too.
-func sanitise(s string) string {
-	if !strings.ContainsFunc(s, isControl) {
-		return s
-	}
-
-	return strings.Map(func(r rune) rune {
-		if isControl(r) {
-			return controlGlyph
-		}
-
-		return r
-	}, s)
-}
-
-// isControl reports whether r is a C0 control, DEL, or a C1 control.
-func isControl(r rune) bool {
-	const (
-		space = 0x20
-		del   = 0x7f
-		c1Lo  = 0x80
-		c1Hi  = 0x9f
-	)
-
-	return r < space || r == del || (r >= c1Lo && r <= c1Hi)
-}
+// The sanitising is the load-bearing half and it is components.Sanitise by
+// ruling rather than a local copy: minion IDs and function names are
+// minion-supplied, a newline here would split one row across two and
+// desynchronise the frame, and a raw ESC would let event data drive the
+// terminal of an operator running this as root on a production master.
+// components.RenderTable does this for the list view, but the drill-down lays
+// its rows out itself in order to colour them per status, so it must do it too.
+//
+// It carries no Ellipsis marker: unlike a ranked top-N label, every string
+// reaching here is either a fixed-width column, whose boundary is itself the
+// cue, or a whole sentence the reader can see running to the edge of the box.
+func fit(s string, w int) string { return components.Fit(components.Sanitise(s), w) }

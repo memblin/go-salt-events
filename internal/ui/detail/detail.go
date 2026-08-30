@@ -24,6 +24,7 @@ import (
 	"github.com/TKC-Labs/go-salt-events/internal/model"
 	"github.com/TKC-Labs/go-salt-events/internal/theme"
 	"github.com/TKC-Labs/go-salt-events/internal/ui"
+	"github.com/TKC-Labs/go-salt-events/internal/ui/components"
 )
 
 // DecodeFunc turns a raw payload into a displayable value.
@@ -106,7 +107,7 @@ func (p *Pane) View(w, h int, _ ui.Snapshot, st *theme.Styles) string {
 	}
 
 	if !p.has {
-		return st.Muted.Render(clip("no event selected — pick one in Live and press enter", w))
+		return st.Muted.Render(components.Fit("no event selected — pick one in Live and press enter", w))
 	}
 
 	lines := p.lines()
@@ -227,20 +228,6 @@ func masterTrimmedLines() []line {
 	}
 }
 
-// clip truncates s to at most w display cells. The style carries no colour, so
-// no palette decision escapes into a pane (spec §3.2).
-func clip(s string, w int) string {
-	if w <= 0 {
-		return ""
-	}
-
-	if lipgloss.Width(s) <= w {
-		return s
-	}
-
-	return lipgloss.NewStyle().MaxWidth(w).Render(s)
-}
-
 // line is one output line, held unstyled.
 //
 // label is the key part and always renders in the KeyLabel style; text is the
@@ -255,9 +242,9 @@ type line struct {
 
 // render styles and truncates l to w cells.
 func (l line) render(w int, st *theme.Styles) string {
-	label := clip(l.label, w)
+	label := components.Fit(l.label, w)
 
-	text := clip(l.text, w-lipgloss.Width(label))
+	text := components.Fit(l.text, w-lipgloss.Width(label))
 	if label == "" {
 		return styleFor(l.slot, st).Render(text)
 	}
@@ -512,38 +499,16 @@ func scalarSlot(text string) slot {
 	return slotValue
 }
 
-// controlGlyph stands in for a control character.
-const controlGlyph = '·'
-
 // sanitise replaces control characters with a visible placeholder.
 //
-// components' table does this for its own cells; this pane renders payload text
-// OUTSIDE that table, so it must do its own. Payload content is minion-supplied
-// and this tool runs as root on a production master: a raw ESC would let event
-// data move the operator's cursor, set the window title, or repaint the screen,
-// and a newline would add a row the height clamp never accounted for.
-func sanitise(s string) string {
-	if !strings.ContainsFunc(s, isControl) {
-		return s
-	}
-
-	return strings.Map(func(r rune) rune {
-		if isControl(r) {
-			return controlGlyph
-		}
-
-		return r
-	}, s)
-}
-
-// isControl reports whether r is a C0 control, DEL, or a C1 control.
-func isControl(r rune) bool {
-	const (
-		space = 0x20
-		del   = 0x7f
-		c1Lo  = 0x80
-		c1Hi  = 0x9f
-	)
-
-	return r < space || r == del || (r >= c1Lo && r <= c1Hi)
-}
+// It is components.Sanitise under a local name because it is called from a
+// dozen leaf cases below and the shorter name keeps them readable. The
+// IMPLEMENTATION is shared by ruling: three panes each grew their own copy of
+// this, the copies diverged, and that divergence was the root cause of the wave
+// review's Critical finding. components' table does this for its own cells;
+// this pane renders payload text OUTSIDE that table, so it must call it here.
+// Payload content is minion-supplied and this tool runs as root on a production
+// master: a raw ESC would let event data move the operator's cursor, set the
+// window title, or repaint the screen, and a newline would add a row the height
+// clamp never accounted for.
+func sanitise(s string) string { return components.Sanitise(s) }

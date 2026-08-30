@@ -384,6 +384,79 @@ func TestJobsSurvivesNilAndTinySnapshots(t *testing.T) {
 	}
 }
 
+// TestJobsFitsItsBox is the width assertion this package did not have.
+//
+// Its absence is why the defect shipped: the nearest equivalent,
+// TestJobsSurvivesNilAndTinySnapshots, checked HEIGHT only and ran every size
+// against an empty or nil-JobLookup snapshot, so it never rendered a POPULATED
+// list or a drill-down into a small box. Two blind spots intersecting exactly
+// on the bug.
+//
+// Overflow here is not a clipped line. The root's frame is
+// PaneFocus.Width(contentW).Height(contentH) and lipgloss Height is a MINIMUM,
+// so an over-long line word-wraps, the frame grows a row per wrap, and the
+// status bar scrolls off the bottom of the terminal. 60 and 72 are in the list
+// because that is where it bites — a split tmux pane, not an 80-column
+// terminal, which is presumably why nobody saw it.
+func TestJobsFitsItsBox(t *testing.T) {
+	t.Parallel()
+
+	st := styles(t)
+
+	// A non-zero eviction count is what makes the index header long: the quiet
+	// form is a dozen cells and would never have caught this.
+	populated := snapWith(bigJob(model.ExpectedKnown))
+	populated.JobStats = stats.IndexStats{Tracked: 500, Cap: 500, Evicted: 37, HighWater: 501}
+
+	empty := ui.Snapshot{JobStats: populated.JobStats}
+
+	renders := map[string]func(s ui.Snapshot, w, h int) string{
+		"list": func(s ui.Snapshot, w, h int) string {
+			return jobs.New().View(w, h, s, st)
+		},
+		"drill-down": func(s ui.Snapshot, w, h int) string {
+			return drill(t, jobs.New(), populated).View(w, h, s, st)
+		},
+		"drill-down, all rows": func(s ui.Snapshot, w, h int) string {
+			p := drill(t, jobs.New(), populated)
+
+			return press(press(press(p, populated, 'f'), populated, 'f'), populated, 'f').
+				View(w, h, s, st)
+		},
+	}
+
+	snaps := map[string]ui.Snapshot{"populated": populated, "empty": empty}
+
+	for rname, render := range renders {
+		for sname, s := range snaps {
+			t.Run(rname+", "+sname, func(t *testing.T) {
+				t.Parallel()
+
+				for _, box := range [][2]int{
+					{1, 1}, {8, 4}, {16, 6}, {20, 10}, {40, 12},
+					{60, 20}, {72, 20}, {80, 24}, {120, 30},
+				} {
+					w, h := box[0], box[1]
+					got := render(s, w, h)
+
+					lines := strings.Split(got, "\n")
+					if len(lines) > h {
+						t.Errorf("%dx%d: rendered %d lines into a %d-line box",
+							w, h, len(lines), h)
+					}
+
+					for i, l := range lines {
+						if lw := lipgloss.Width(l); lw > w {
+							t.Errorf("%dx%d: line %d is %d cells wide: %q",
+								w, h, i, lw, ansi.Strip(l))
+						}
+					}
+				}
+			})
+		}
+	}
+}
+
 func TestJobsKeysReportWhatIsBoundNow(t *testing.T) {
 	t.Parallel()
 
@@ -429,24 +502,50 @@ func TestJobsSanitisesMinionSuppliedText(t *testing.T) {
 
 	// Minion IDs and function names come off the bus. A newline would
 	// desynchronise the frame; a raw ESC would let event data drive the
-	// operator's terminal.
+	// operator's terminal, and this tool is expected to run as root on a
+	// production master.
+	//
+	// The assertion is against the RAW output, per injected sequence. An
+	// earlier version tested strings.Contains(ansi.Strip(got), "\x1b"), which
+	// cannot fail for the escape half of its claim: ansi.Strip REMOVES
+	// well-formed CSI sequences, including the injected "\x1b[2J", so it was
+	// asserting only that a MALFORMED escape had survived stripping — the one
+	// case an attacker would never send. Mutation-proved: deleting sanitise
+	// from jobs.fit left that version, and the whole Jobs suite, green.
+	//
+	// None of the tokens below can be produced by this pane's own styling: SGR
+	// sequences begin "\x1b[" and terminate in "m", never in "J", and neither
+	// OSC (ESC ]) nor BEL nor a tab appears anywhere in a theme's output.
 	j := model.NewJob("20260830081402123456")
 	j.Fun = "state.\x1b[2Japply"
-	j.Tgt = "webs"
+	j.Tgt = "webs\x1b]0;pwned\x07"
 	j.ExpectedState = model.ExpectedKnown
 	j.AddExpected("evil\nminion")
+	j.AddExpected("tab\thost\x1b]0;pwned\x07")
 	j.AddExpected("web-01.dc1.example.com")
 	j.AddReturn(model.RetInfo{Minion: "web-01.dc1.example.com", RetCode: 0, Success: true})
+	j.AddReturn(model.RetInfo{Minion: "bad\x1b[2Jminion", RetCode: 1, Success: false})
 
 	s := snapWith(j)
 	st := styles(t)
 
-	for _, got := range []string{
-		jobs.New().View(120, 24, s, st),
-		press(press(drill(t, jobs.New(), s), s, 'f'), s, 'f').View(120, 24, s, st),
-	} {
-		if strings.Contains(ansi.Strip(got), "\x1b") || strings.Contains(got, "evil\nminion") {
-			t.Errorf("bus-supplied text reached the terminal unsanitised:\n%q", got)
+	views := map[string]string{
+		"list":          jobs.New().View(120, 24, s, st),
+		"drill-down":    drill(t, jobs.New(), s).View(120, 24, s, st),
+		"missing only":  press(press(drill(t, jobs.New(), s), s, 'f'), s, 'f').View(120, 24, s, st),
+		"all rows":      press(press(press(drill(t, jobs.New(), s), s, 'f'), s, 'f'), s, 'f').View(120, 24, s, st),
+		"narrow drill":  drill(t, jobs.New(), s).View(60, 24, s, st),
+		"narrow list":   jobs.New().View(60, 24, s, st),
+		"tiny drill":    drill(t, jobs.New(), s).View(12, 8, s, st),
+		"one-cell list": jobs.New().View(1, 1, s, st),
+	}
+
+	for name, got := range views {
+		for _, bad := range []string{"\x1b[2J", "\x1b]0;", "\x07", "\t", "evil\nminion"} {
+			if strings.Contains(got, bad) {
+				t.Errorf("%s: bus-supplied %q reached the terminal unsanitised:\n%q",
+					name, bad, got)
+			}
 		}
 	}
 }

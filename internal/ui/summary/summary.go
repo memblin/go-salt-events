@@ -20,9 +20,9 @@
 // can event.send an arbitrarily long tag and Category derives from it.
 // Bounding it upstream would truncate legitimate tags at the source and need a
 // marker that could collide with real tag text exactly as "*" did, so the
-// stored value stays faithful and clip() shortens it to fit the column, with a
-// visible indicator. A 50,000-character category costs this pane O(column
-// width), not O(length).
+// stored value stays faithful and components.RankedLabel shortens it to fit the
+// column, with a visible indicator. A 50,000-character category costs this pane
+// O(column width), not O(length).
 package summary
 
 import (
@@ -67,22 +67,13 @@ func (p *Pane) Update(tea.Msg, ui.Snapshot) (ui.Pane, tea.Cmd) { return p, nil }
 // commit, or it ships undiscoverable.
 func (p *Pane) Keys() []ui.KeyHint { return nil }
 
-// Block titles and the two substitutes for an unnameable key.
+// Block titles. The two substitutes for an unnameable key live in
+// internal/ui/components (PublishAck, NoKey) because the Rate pane renders the
+// same ranked slices and an operator compares the two screens.
 const (
 	tagsTitle    = "Top tags"
 	minionsTitle = "Top minions"
 	funcsTitle   = "Top functions"
-
-	// publishAck names the empty Category. The bare-JID publish-ack is a real,
-	// frequent event class; rendering a blank label for it would leave a bar
-	// and a percentage attached to nothing an operator could act on.
-	publishAck = "(master job publish-ack)"
-
-	// noKey is the substitute for an empty minion or function. Neither should
-	// occur — both are extracted from tag segments that exist or do not — but
-	// a blank row is never an acceptable render, and this pane must not panic
-	// or mislead on bus-derived data.
-	noKey = "(none)"
 
 	nothingYet = "(nothing yet)"
 )
@@ -103,17 +94,6 @@ const (
 	// rows) regardless of how many keys the counter tracks (invariant 6).
 	topRows = 8
 )
-
-// ellipsis marks a clipped label. It is one cell wide and cannot be confused
-// with a wildcard or with tag syntax.
-const ellipsis = "…"
-
-// maxCellBytes bounds the work clip does before measuring. A display cell can
-// never be produced by more than four UTF-8 bytes of *width-bearing* text, so
-// cutting the input to maxCellBytes×width bytes keeps a pathological
-// 50,000-character category from costing a full-length scan on every one of
-// the ten frames drawn each second.
-const maxCellBytes = 4
 
 // View renders the pane into a w×h CONTENT box.
 //
@@ -156,7 +136,7 @@ func (p *Pane) View(w, h int, s ui.Snapshot, st *theme.Styles) string {
 	lines = append(lines, tail...)
 
 	for i, l := range lines {
-		lines[i] = fit(l, w)
+		lines[i] = components.Fit(l, w)
 	}
 
 	return strings.Join(lines, "\n")
@@ -166,11 +146,11 @@ func (p *Pane) View(w, h int, s ui.Snapshot, st *theme.Styles) string {
 func (p *Pane) blocks(w int, s ui.Snapshot, st *theme.Styles) []string {
 	lay := layoutRow(w)
 
-	out := block(tagsTitle, publishAck, s.TopCategories, lay, st)
+	out := block(tagsTitle, components.PublishAck, s.TopCategories, lay, st)
 	out = append(out, "")
-	out = append(out, block(minionsTitle, noKey, s.TopMinions, lay, st)...)
+	out = append(out, block(minionsTitle, components.NoKey, s.TopMinions, lay, st)...)
 	out = append(out, "")
-	out = append(out, block(funcsTitle, noKey, s.TopFunctions, lay, st)...)
+	out = append(out, block(funcsTitle, components.NoKey, s.TopFunctions, lay, st)...)
 
 	return out
 }
@@ -245,7 +225,7 @@ func entryRow(e stats.Entry, empty string, lay rowLayout, st *theme.Styles) stri
 		return ""
 	}
 
-	row := indent() + st.Value.Render(padTo(labelOf(e.Key, empty), lay.label))
+	row := indent() + st.Value.Render(components.RankedLabel(e.Key, empty, lay.label))
 
 	if lay.bar > 0 {
 		row += " " + components.Bar(e.Pct, lay.bar, st)
@@ -260,20 +240,6 @@ func entryRow(e stats.Entry, empty string, lay rowLayout, st *theme.Styles) stri
 	}
 
 	return row
-}
-
-// labelOf returns the text to print for a ranked key.
-//
-// The substitution happens HERE, at render time, and nowhere else: the counter
-// and the snapshot keep the empty string, because a placeholder stored
-// upstream would be indistinguishable from a minion-sent tag containing the
-// same text.
-func labelOf(key, empty string) string {
-	if key == "" {
-		return empty
-	}
-
-	return key
 }
 
 // indexLines reports job-index pressure (spec §7.5) as one line, or as two
@@ -335,109 +301,6 @@ func guidanceFor(is stats.IndexStats, w int, st *theme.Styles) string {
 	}
 
 	return st.Warn.Render(full)
-}
-
-// clip fits s into at most w display cells, marking any loss with ellipsis.
-//
-// This is the only bound on a Category's length in the whole tool, by ruling:
-// the stored value stays faithful to what the minion sent and is shortened
-// only for display. Three things therefore happen here, in order — a byte
-// bound so the work is O(w) rather than O(len(s)); sanitisation, because this
-// text is not routed through components.RenderTable and arrives from the bus;
-// and the width fit itself.
-func clip(s string, w int) string {
-	if w <= 0 {
-		return ""
-	}
-
-	cut := false
-
-	if maxBytes := maxCellBytes * w; len(s) > maxBytes {
-		// ToValidUTF8 removes the partial rune the byte cut may have left, and
-		// any invalid sequence the bus supplied. Cutting by bytes can only
-		// ever discard text that was already past the column.
-		s = strings.ToValidUTF8(s[:maxBytes], "")
-		cut = true
-	}
-
-	s = sanitise(s)
-
-	if !cut && lipgloss.Width(s) <= w {
-		return s
-	}
-
-	if w == 1 {
-		return ellipsis
-	}
-
-	return fit(s, w-1) + ellipsis
-}
-
-// sanitise replaces control characters with a visible placeholder.
-//
-// Category and minion strings are minion-supplied: a minion can event.send any
-// tag it likes. components.RenderTable does this for the panes that render
-// through it, but this pane lays its rows out itself, so it must do it itself
-// too. A raw ESC would otherwise let bus data drive the terminal of an
-// operator running this as root on a production master, and a newline would
-// split one row across two lines and desynchronise the whole frame. A tab is
-// included because its width depends on the terminal's stops and so cannot be
-// measured.
-func sanitise(s string) string {
-	if !strings.ContainsFunc(s, isControl) {
-		return s
-	}
-
-	return strings.Map(func(r rune) rune {
-		if isControl(r) {
-			return controlGlyph
-		}
-
-		return r
-	}, s)
-}
-
-// controlGlyph stands in for a control character.
-const controlGlyph = '·'
-
-// isControl reports whether r is a C0 control, DEL, or a C1 control.
-func isControl(r rune) bool {
-	const (
-		space = 0x20
-		del   = 0x7f
-		c1Lo  = 0x80
-		c1Hi  = 0x9f
-	)
-
-	return r < space || r == del || (r >= c1Lo && r <= c1Hi)
-}
-
-// fit truncates s to at most w DISPLAY cells.
-//
-// Display cells, not bytes or runes: these strings carry ANSI styling, and
-// cutting one by index would slice an escape sequence in half — and would make
-// the truncation point depend on the theme, which the layout guard forbids.
-func fit(s string, w int) string {
-	if w <= 0 {
-		return ""
-	}
-
-	return lipgloss.NewStyle().MaxWidth(w).Render(s)
-}
-
-// padTo renders s into exactly w display cells, clipping or right-padding.
-func padTo(s string, w int) string {
-	if w <= 0 {
-		return ""
-	}
-
-	s = clip(s, w)
-
-	if pad := w - lipgloss.Width(s); pad > 0 {
-		s += strings.Repeat(" ", pad)
-	}
-
-	return s
 }
 
 // indent is the leading gutter shared by every row under a block title.

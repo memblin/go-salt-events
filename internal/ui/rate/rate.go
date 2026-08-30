@@ -16,7 +16,6 @@ import (
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 
 	"github.com/TKC-Labs/go-salt-events/internal/stats"
 	"github.com/TKC-Labs/go-salt-events/internal/theme"
@@ -85,6 +84,11 @@ const (
 	secTitle = "Events/sec  last 120s"
 	minTitle = "Events/min  last 60m "
 
+	// The two breakdown titles. They match the Summary pane's wording for the
+	// same slices on purpose.
+	tagsTitle    = "Top tags"
+	minionsTitle = "Top minions"
+
 	// barCells and pctCells size a top-N row; gapCells is the two single
 	// spaces separating label, bar and percentage.
 	barCells = 10
@@ -119,7 +123,7 @@ func (p *Pane) View(w, h int, s ui.Snapshot, st *theme.Styles) string {
 	}
 
 	for i, l := range lines {
-		lines[i] = fit(l, w)
+		lines[i] = components.Fit(l, w)
 	}
 
 	return strings.Join(lines, "\n")
@@ -190,13 +194,13 @@ func (p *Pane) breakdowns(w int, s ui.Snapshot, st *theme.Styles) []string {
 	half := w/2 - 1
 	if half < sideBySide {
 		return append(
-			topBlock("Top tags", s.TopCategories, w, st),
-			topBlock("Top minions", s.TopMinions, w, st)...,
+			topBlock(tagsTitle, components.PublishAck, s.TopCategories, w, st),
+			topBlock(minionsTitle, components.NoKey, s.TopMinions, w, st)...,
 		)
 	}
 
-	left := topBlock("Top tags", s.TopCategories, half, st)
-	right := topBlock("Top minions", s.TopMinions, half, st)
+	left := topBlock(tagsTitle, components.PublishAck, s.TopCategories, half, st)
+	right := topBlock(minionsTitle, components.NoKey, s.TopMinions, half, st)
 
 	rows := max(len(left), len(right))
 	out := make([]string, 0, rows)
@@ -212,7 +216,7 @@ func (p *Pane) breakdowns(w int, s ui.Snapshot, st *theme.Styles) []string {
 			r = right[i]
 		}
 
-		out = append(out, padTo(l, half)+" "+r)
+		out = append(out, components.PadTo(l, half)+" "+r)
 	}
 
 	return out
@@ -222,9 +226,15 @@ func (p *Pane) breakdowns(w int, s ui.Snapshot, st *theme.Styles) []string {
 //
 // One hue, bar length carries magnitude, the text label carries identity. No
 // colour-by-rank: a reshuffling ranking must not repaint rows (spec §9).
-func topBlock(title string, entries []stats.Entry, w int, st *theme.Styles) []string {
+//
+// empty is the wording for an entry whose Key is the empty string. It is passed
+// in rather than hardcoded because the correct wording depends on the
+// breakdown, and it comes from components rather than from here because the
+// Summary pane renders these SAME slices — two spellings of one key across two
+// screens would read as two different keys.
+func topBlock(title, empty string, entries []stats.Entry, w int, st *theme.Styles) []string {
 	out := make([]string, 0, topRows+1)
-	out = append(out, st.Header.Render(fit(title, w)))
+	out = append(out, st.Header.Render(components.Fit(title, w)))
 
 	barW := min(barCells, w/3)
 	labelW := w - barW - pctCells - gapCells
@@ -234,7 +244,7 @@ func topBlock(title string, entries []stats.Entry, w int, st *theme.Styles) []st
 			break
 		}
 
-		out = append(out, entryRow(e, labelW, barW, st))
+		out = append(out, entryRow(e, empty, labelW, barW, st))
 	}
 
 	return out
@@ -242,12 +252,19 @@ func topBlock(title string, entries []stats.Entry, w int, st *theme.Styles) []st
 
 // entryRow renders one ranked entry. A box too narrow for even a truncated
 // label renders blank rather than a misleading fragment.
-func entryRow(e stats.Entry, labelW, barW int, st *theme.Styles) string {
+//
+// The label goes through components.RankedLabel, which is what keeps this pane
+// honest about bus data: Entry.Key is a tag or minion ID a minion can set to
+// anything via event.send, so it is bounded (invariant 6), sanitised — a raw
+// ESC would drive a root operator's terminal and a newline would defeat the
+// height clamp above — and marked when it is cut, so a truncated tag cannot be
+// mistaken for a tag that genuinely ends there.
+func entryRow(e stats.Entry, empty string, labelW, barW int, st *theme.Styles) string {
 	if labelW < 1 {
 		return ""
 	}
 
-	row := st.Value.Render(padTo(e.Key, labelW))
+	row := st.Value.Render(components.RankedLabel(e.Key, empty, labelW))
 
 	if barW > 0 {
 		row += " " + components.Bar(e.Pct, barW, st)
@@ -266,33 +283,4 @@ func human(v float64) string {
 	default:
 		return fmt.Sprintf("%.0f", v)
 	}
-}
-
-// fit truncates s to at most w DISPLAY cells.
-//
-// Display cells, not bytes or runes: these strings carry ANSI styling, and
-// cutting one by rune index would slice an escape sequence in half — and would
-// also make the truncation point depend on the theme, which the layout guard
-// forbids.
-func fit(s string, w int) string {
-	if w <= 0 {
-		return ""
-	}
-
-	return lipgloss.NewStyle().MaxWidth(w).Render(s)
-}
-
-// padTo fits s to exactly w display cells, right-padding with spaces.
-func padTo(s string, w int) string {
-	if w <= 0 {
-		return ""
-	}
-
-	s = fit(s, w)
-
-	if pad := w - lipgloss.Width(s); pad > 0 {
-		s += strings.Repeat(" ", pad)
-	}
-
-	return s
 }

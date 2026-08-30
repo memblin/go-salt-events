@@ -13,7 +13,6 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 
 	"github.com/TKC-Labs/go-salt-events/internal/model"
 	"github.com/TKC-Labs/go-salt-events/internal/theme"
@@ -135,7 +134,7 @@ func (p *Pane) View(w, h int, s ui.Snapshot, st *theme.Styles) string {
 		// Clipped like every other line: mid-resize the box can be narrower
 		// than this sentence, and a pane that overflows only when it has
 		// nothing to show is the case nobody exercises by hand.
-		return st.Muted.Render(clip("waiting for events…", w))
+		return st.Muted.Render(components.Fit("waiting for events…", w))
 	}
 
 	rows := max(1, h-headerRows)
@@ -170,16 +169,6 @@ func (p *Pane) View(w, h int, s ui.Snapshot, st *theme.Styles) string {
 	}
 
 	return strings.Join(lines, "\n")
-}
-
-// clip truncates s to at most w display cells. The style carries no colour, so
-// it is not a palette decision escaping into a pane (spec §3.2).
-func clip(s string, w int) string {
-	if lipgloss.Width(s) <= w {
-		return s
-	}
-
-	return lipgloss.NewStyle().MaxWidth(w).Render(s)
 }
 
 // windowStart picks the first visible row: the tail by default, scrolled back
