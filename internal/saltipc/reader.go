@@ -13,6 +13,7 @@ import (
 	"github.com/TKC-Labs/go-salt-events/internal/config"
 	"github.com/TKC-Labs/go-salt-events/internal/model"
 	"github.com/TKC-Labs/go-salt-events/internal/salttag"
+	"github.com/TKC-Labs/go-salt-events/internal/stats"
 )
 
 // Sink receives everything the reader produces. The cache and the stats
@@ -43,6 +44,22 @@ type Sink interface {
 	// DecodeError reports a frame we could not read. Counted and surfaced,
 	// never fatal.
 	DecodeError(error)
+
+	// Attached reports whether the reader currently holds the publish socket.
+	//
+	// It exists because connectedness is a property of the SOCKET and there is
+	// nowhere else to learn it. Inferring it from event arrival instead makes a
+	// healthy but quiet master read DISCONNECTED — the exact inverse of spec
+	// §8.2's concern, and worse during an incident, because the operator is
+	// told the tool is broken when it is working.
+	//
+	// It is a LEVEL, not an edge: true on every successful dial, false the
+	// moment the connection is lost or a dial fails, and it may be repeated.
+	// Implementations must be idempotent and must not derive it from anything
+	// else. In particular Gap must not clear it — Run closes an outage window
+	// by calling Gap on the RECONNECT path, so the one call that means "we are
+	// back" would be the call that says "we are gone".
+	Attached(bool)
 }
 
 // ErrNotPubSocket reports that the path we were about to open does not resolve
@@ -62,11 +79,21 @@ const (
 //
 // A single report per retry is not enough at the far end of the backoff: the
 // rate rings expire buckets by wall clock, so buckets opened after the last
-// report are empty and unflagged, and at the 5s maximum backoff the newest
-// seconds bucket — the one the Rate pane prints as "now" — would read a flat
-// zero again for most of every wait. One report per bucket width keeps the head
-// of the ring truthful for the whole outage.
-const gapRefresh = time.Second
+// report would be empty, and at the 5s maximum backoff the newest seconds
+// bucket — the one the Rate pane prints as "now" — would read a flat zero again
+// for most of every wait.
+//
+// It is stats.GapReportInterval and not a number of its own. That is the point:
+// this used to be an independent time.Second which happened to equal the rate
+// ring's bucket width, and equal was never sufficient — two 1 Hz processes with
+// an arbitrary phase offset cannot cover each other, so on a live outage the
+// `now` callout flipped between "no data" and "0" about once a second. The
+// coupling is now a stated contract on the other side of the boundary (see
+// stats.GapValidity): the ring treats a report as describing the present for
+// GapValidity afterwards, on the promise that a reporter repeats it at least
+// every GapReportInterval. This is the reader keeping that promise, and there is
+// no second constant left to drift.
+const gapRefresh = stats.GapReportInterval
 
 // Reader owns the publish socket for the process lifetime.
 //
@@ -140,6 +167,12 @@ func (r *Reader) Run(ctx context.Context, sink Sink) error {
 
 		conn, err := r.dial()
 		if err != nil {
+			// Said before the retry decision so a sink learns about a failed
+			// FIRST dial too: Run returns permanently in that case, and a
+			// console left reading "connected" for a reader that has died is
+			// the worst of both.
+			sink.Attached(false)
+
 			// A path that is not the publish socket is never retried.
 			if !connected || errors.Is(err, ErrNotPubSocket) {
 				return err
@@ -160,6 +193,11 @@ func (r *Reader) Run(ctx context.Context, sink Sink) error {
 			continue
 		}
 
+		// The socket is open. This is the only thing that means "connected",
+		// and it is said before the first byte arrives because a quiet master
+		// is a healthy master.
+		sink.Attached(true)
+
 		if connected {
 			// Closes the window at the instant it actually ended, which the
 			// reports made during the wait could only approximate.
@@ -170,7 +208,29 @@ func (r *Reader) Run(ctx context.Context, sink Sink) error {
 		backoff = minBackoff
 
 		lostAt = r.consume(ctx, conn, sink)
+
+		// consume only returns once the stream has ended, so we are blind from
+		// here until the next successful dial — including while ctx is being
+		// cancelled, which is the shutdown path and harms nothing.
+		sink.Attached(false)
 	}
+}
+
+// Dial opens the publish socket for reading, applying every layer of
+// invariant 1, and hands the caller the connection.
+//
+// It exists for --capture, which records raw frames off the live bus and
+// therefore needs the socket rather than decoded events. It is the ONE
+// supported way to obtain that connection: a second, hand-rolled net.Dial next
+// to this one has layer 1 (the basename is derived from the directory) but not
+// layer 2 (the RESOLVED basename is re-checked), which leaves the symlink route
+// to master_event_pull.ipc open on that path. There is no reason to write
+// another dial; use this.
+//
+// The caller owns the connection and must close it. Nothing in this package
+// ever writes to it and neither may the caller (invariant 1, layer 3).
+func (r *Reader) Dial() (net.Conn, error) {
+	return r.dial()
 }
 
 // dial opens the publish socket, refusing anything that is not it.

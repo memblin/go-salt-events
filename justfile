@@ -27,7 +27,9 @@ test-race:
 test-ci:
     go test -count=1 -race -coverprofile=coverage.out ./...
 
-# Requires a live salt-master and root. Auto-skips when the socket is absent.
+# Requires a live salt-master and root. Auto-skips when the socket is absent or
+# unreadable; set SALT_EVENTS_REQUIRE_BUS=1 to turn those skips into failures.
+# Never set that in CI — no runner can host a master, so it would be red always.
 test-integration:
     go test -count=1 -p 1 -tags=integration ./...
 

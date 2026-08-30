@@ -46,6 +46,12 @@ var palettes = map[string]Palette{
 // DefaultName is the palette used when none is configured.
 const DefaultName = "gruvbox-dark"
 
+// MonoName is the colourless palette. --no-color selects it by name rather
+// than stripping colour downstream: mono is a registered palette in which bar
+// length and text labels carry the entire encoding (spec §9), so the console
+// stays readable instead of merely losing its hues.
+const MonoName = "mono"
+
 // Names returns every palette name, sorted.
 func Names() []string {
 	out := make([]string, 0, len(palettes))

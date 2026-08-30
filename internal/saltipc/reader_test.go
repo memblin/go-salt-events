@@ -2,10 +2,12 @@ package saltipc_test
 
 import (
 	"context"
+	"errors"
 	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -40,6 +42,7 @@ type recordSink struct {
 	events []model.Event
 	gaps   []gapWindow
 	errs   int
+	attach []bool
 
 	reachedOnce sync.Once
 	reached     chan struct{}
@@ -72,6 +75,28 @@ func (s *recordSink) DecodeError(error) {
 	defer s.mu.Unlock()
 
 	s.errs++
+}
+
+// Attached records every level change the reader reports, in order, so a test
+// can assert on the SEQUENCE rather than only on the final value — "connected,
+// then not, then connected again" is a different story from "still connected",
+// and only the sequence tells them apart.
+func (s *recordSink) Attached(attached bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.attach = append(s.attach, attached)
+}
+
+// attaches returns the recorded Attached sequence.
+func (s *recordSink) attaches() []bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	out := make([]bool, len(s.attach))
+	copy(out, s.attach)
+
+	return out
 }
 
 func (s *recordSink) snapshot() ([]model.Event, []gapWindow, int) {
@@ -571,6 +596,125 @@ func TestReaderRefusesASocketThatResolvesElsewhere(t *testing.T) {
 	}
 }
 
+// TestReaderReportsWhetherItHoldsTheSocket is where connectedness comes from.
+//
+// There was no such signal, so the hub inferred it from event arrival — which
+// makes a healthy but quiet master read DISCONNECTED, and makes the Gap that
+// CLOSES an outage window read as a fresh one. The sequence matters more than
+// the final value: "attached, lost, attached again" is the story of a master
+// restart, and only the ordered record can tell it from "still attached".
+func TestReaderReportsWhetherItHoldsTheSocket(t *testing.T) {
+	t.Parallel()
+
+	srv := newBusServer(t, pubSocket)
+	srv.serve(frame(t, "salt/auth", map[string]any{"act": "accept"}), 2, 0)
+
+	sink := newRecordSink(2)
+
+	if err := runUntil(t, saltipc.NewReader(srv.dir, time.Now), sink); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	got := sink.attaches()
+
+	if len(got) < 3 {
+		t.Fatalf("Attached was reported %v; a connect/drop/reconnect cycle must "+
+			"produce at least true, false, true", got)
+	}
+
+	if !got[0] {
+		t.Errorf("the first Attached report was %v; the socket was open before any "+
+			"event arrived, and a quiet master is a healthy master", got[0])
+	}
+
+	if !slices.Contains(got, false) {
+		t.Errorf("Attached never went false across a disconnect: %v", got)
+	}
+
+	// The reader must be reporting attached again by the time the second
+	// connection is delivering events; otherwise a successful reconnect still
+	// renders as an outage.
+	last := slices.Index(got, false)
+	if !slices.Contains(got[last:], true) {
+		t.Errorf("Attached never went true again after the reconnect: %v", got)
+	}
+}
+
+// TestReaderReportsAFailedFirstDialAsDetached covers the path Run returns on:
+// a first dial that fails is permanent, and a console left reading "connected"
+// for a reader that has died is the worst of both.
+func TestReaderReportsAFailedFirstDialAsDetached(t *testing.T) {
+	t.Parallel()
+
+	sink := newRecordSink(1)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+
+	// A directory with no socket in it at all.
+	err := saltipc.NewReader(t.TempDir(), time.Now).Run(ctx, sink)
+	if err == nil {
+		t.Fatal("Run returned nil for a socket that does not exist")
+	}
+
+	got := sink.attaches()
+	if len(got) != 1 || got[0] {
+		t.Errorf("Attached reports = %v, want exactly one false", got)
+	}
+}
+
+// TestNotPubSocketIsIdentifiableAndDiagnosable pins the SENTINEL, which is a
+// separate contract from the message text the test above checks.
+//
+// Two things branch on errors.Is(err, ErrNotPubSocket) and neither reads the
+// text: Run refuses to retry it (every other dial failure drives the backoff
+// loop, and retrying this one forever would be exactly the wrong response to
+// "that is not our socket"), and Diagnose turns it into invariant 1's
+// explanation rather than a bare errno. An error that stopped wrapping the
+// sentinel would leave both silently taking the wrong branch, and the existing
+// message assertion would still pass.
+func TestNotPubSocketIsIdentifiableAndDiagnosable(t *testing.T) {
+	t.Parallel()
+
+	srv := newBusServer(t, pullSocket)
+	srv.serve(nil, 1, 0)
+
+	if err := os.Symlink(filepath.Join(srv.dir, pullSocket),
+		filepath.Join(srv.dir, pubSocket)); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	reader := saltipc.NewReader(srv.dir, time.Now)
+
+	conn, err := reader.Dial()
+	if err == nil {
+		_ = conn.Close()
+
+		t.Fatal("Dial opened a publish socket that resolves to the pull socket")
+	}
+
+	if !errors.Is(err, saltipc.ErrNotPubSocket) {
+		t.Fatalf("Dial returned %v, which does not identify itself as ErrNotPubSocket; "+
+			"Run would retry it forever and Diagnose would print a bare errno", err)
+	}
+
+	if srv.acceptCount() != 0 {
+		t.Error("the pull socket was connected to; invariant 1 is broken")
+	}
+
+	got := saltipc.Diagnose(reader.SocketPath(), err)
+
+	for _, want := range []string{
+		"refusing to open",
+		"structurally incapable of injecting events",
+		pubSocket,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("Diagnose(%v) does not mention %q:\n%s", err, want, got)
+		}
+	}
+}
+
 // TestReaderReportsAGapAcrossAReconnect covers spec §8.2: a disconnection that
 // draws as a flat line at zero is indistinguishable from a quiet master, which
 // is exactly backwards during an incident.
@@ -661,6 +805,13 @@ type ringSink struct {
 	// about the outage that follows it.
 	gapAfter time.Time
 
+	// gapAt is the WALL-CLOCK instant of every report. The logical clock cannot
+	// answer this: the reader's refresh rate is a property of its real sleeps,
+	// and what it has to be fast enough for is stats.GapValidity, which is also
+	// real time. It pins the REFRESH RATE rather than merely the fact that a
+	// report happens at all.
+	gapAt []time.Time
+
 	gappedOnce sync.Once
 	gapped     chan struct{}
 
@@ -688,6 +839,7 @@ func (s *ringSink) Event(e model.Event) {
 func (s *ringSink) Gap(from, to time.Time) {
 	s.mu.Lock()
 	s.rings.MarkGap(from, to)
+	s.gapAt = append(s.gapAt, time.Now())
 	s.mu.Unlock()
 
 	if !to.Before(s.gapAfter) {
@@ -695,7 +847,17 @@ func (s *ringSink) Gap(from, to time.Time) {
 	}
 }
 
+// gapTimes is a copy of every report instant so far.
+func (s *ringSink) gapTimes() []time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return append([]time.Time(nil), s.gapAt...)
+}
+
 func (s *ringSink) DecodeError(error) {}
+
+func (s *ringSink) Attached(bool) {}
 
 func (s *ringSink) summarySeconds() (stats.Summary, stats.Bucket) {
 	s.mu.Lock()
@@ -971,5 +1133,117 @@ func TestFakeFeedDataRunsTheRealExtractPath(t *testing.T) {
 
 	if len(e.Payload) == 0 {
 		t.Error("Payload is empty; FeedData must produce real msgpack")
+	}
+}
+
+// TestTheReaderRepeatsAGapOftenEnoughForTheRings is the reader's half of the
+// contract stats.GapValidity states.
+//
+// stats.Rings extrapolates a reported gap forward for GapValidity, which is
+// what stops a bucket rolling over mid-outage from opening as a genuine zero —
+// but only on the promise that a reporter repeats itself at least every
+// GapReportInterval. Nothing in the type system enforces that: gapRefresh could
+// be multiplied by four tomorrow and every unit test on either side would still
+// pass while the `now` callout went back to flickering between "no data" and
+// "0" on a live master.
+//
+// So this measures the SPACING of the reports a running reader really delivers,
+// and it measures it late enough in the outage to be measuring the right thing.
+// Early on, the retry backoff is shorter than the refresh period and every
+// round emits a report of its own, which hides the refresh rate entirely; only
+// once the backoff has grown past it does gapRefresh become what governs the
+// spacing. Hence the settle: by then the reader is in the 1s and 2s rounds on
+// its way to the 5s ceiling.
+//
+// The bound is loose relative to GapReportInterval and tight relative to
+// GapValidity, because that is the property that matters — a report is allowed
+// to be late, but not so late that the ring stops covering the rollover.
+func TestTheReaderRepeatsAGapOftenEnoughForTheRings(t *testing.T) {
+	t.Parallel()
+
+	// settle waits out the short backoff rounds; observe is the window the
+	// spacing is measured over.
+	const (
+		settle  = 1200 * time.Millisecond
+		observe = 2500 * time.Millisecond
+	)
+
+	srv := newBusServer(t, pubSocket)
+	srv.serve(frame(t, "salt/auth", map[string]any{"act": "accept"}), 1, 0)
+
+	start := time.Date(2026, 8, 30, 8, 14, 0, 0, time.UTC)
+	clk := &testClock{t: start}
+	sink := newRingSink(stats.NewRings(clk), start)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+
+	go func() { done <- saltipc.NewReader(srv.dir, clk.Now).Run(ctx, sink) }()
+
+	// The master is gone for good once serve has accepted its one connection:
+	// the listener closes, which unlinks the socket, so every dial from here on
+	// fails and the reader is permanently in waitToRetry.
+	select {
+	case <-sink.gapped:
+	case err := <-done:
+		t.Fatalf("Run returned %v without reporting the outage in progress", err)
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for the first gap report")
+	}
+
+	time.Sleep(settle)
+
+	from := time.Now()
+
+	time.Sleep(observe)
+
+	until := time.Now()
+
+	cancel()
+	<-done
+
+	// The spacing to measure includes the run up to the window's start and down
+	// to its end: a reader silent for the whole window would otherwise show no
+	// spacing at all and pass.
+	var (
+		worst time.Duration
+		prev  = from
+		seen  int
+	)
+
+	for _, at := range sink.gapTimes() {
+		if at.Before(from) {
+			prev = at
+
+			continue
+		}
+
+		if at.After(until) {
+			break
+		}
+
+		if d := at.Sub(prev); d > worst {
+			worst = d
+		}
+
+		prev, seen = at, seen+1
+	}
+
+	if d := until.Sub(prev); d > worst {
+		worst = d
+	}
+
+	if seen == 0 {
+		t.Fatalf("premise failed: no gap reports at all in %v of outage", observe)
+	}
+
+	if limit := 2 * stats.GapReportInterval; worst > limit {
+		t.Errorf("the reader left %v between two gap reports (%d reports in %v), "+
+			"want at most %v: stats.Rings keeps the head bucket honest for only %v "+
+			"after a report, so a bucket rolling over in that silence opens as a "+
+			"genuine 0 and the Rate pane prints a quiet master (spec §8.2)",
+			worst, seen, observe, limit, stats.GapValidity)
 	}
 }

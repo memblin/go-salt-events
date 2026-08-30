@@ -143,7 +143,7 @@ func TestCacheSnapshotAppliesTheMatcher(t *testing.T) {
 
 	only := matcherFunc(func(e model.Event) bool { return e.Tag == "salt/auth" })
 
-	got := c.Snapshot(only, 100)
+	got, _ := c.Snapshot(only, 100)
 	if len(got) != 1 || got[0].Tag != "salt/auth" {
 		t.Errorf("Snapshot = %v", got)
 	}
@@ -359,7 +359,7 @@ func TestCacheSnapshotLimit(t *testing.T) {
 				c.Add(e)
 			}
 
-			got := c.Snapshot(tt.matcher, tt.limit)
+			got, _ := c.Snapshot(tt.matcher, tt.limit)
 			if len(got) != len(tt.wantTags) {
 				t.Fatalf("Snapshot returned %d events, want %d", len(got), len(tt.wantTags))
 			}
@@ -554,7 +554,7 @@ func TestSnapshotFiltersWithARealQuery(t *testing.T) {
 		t.Fatalf("Parse: %v", err)
 	}
 
-	got := c.Snapshot(q, 10)
+	got, _ := c.Snapshot(q, 10)
 
 	want := []string{
 		"salt/job/20260830081402123456/ret/web-1",
@@ -569,5 +569,166 @@ func TestSnapshotFiltersWithARealQuery(t *testing.T) {
 		if e.Tag != want[i] {
 			t.Errorf("event %d: Tag = %q, want %q", i, e.Tag, want[i])
 		}
+	}
+}
+
+// countingMatcher records how many events Snapshot actually examined.
+//
+// The observable for invariant 6 is WORK, not output: a snapshot that scans
+// the whole ring and a snapshot that scans a bounded window can return exactly
+// the same events, and only the count tells them apart. An assertion on the
+// returned slice cannot see this regression at all.
+type countingMatcher struct {
+	calls int
+	pick  func(model.Event) bool
+}
+
+func (c *countingMatcher) Match(e model.Event) bool {
+	c.calls++
+
+	return c.pick(e)
+}
+
+// fill adds n cheap events to c.
+func fill(c *cache.Cache, n int) {
+	for i := range n {
+		c.Add(event(fmt.Sprintf("salt/minion/web-%d/start", i), 8))
+	}
+}
+
+// TestSnapshotWorkIsBoundedByTheLimitNotByTheCache is invariant 6's liveness
+// half.
+//
+// hub.Snapshot calls this under the ingest mutex, so every event examined here
+// is an event the reader goroutine is blocked for. Scanning backwards until
+// `limit` matches are found means a SELECTIVE filter — which is what an
+// operator narrows to during a storm, the exact situation this console exists
+// for — scans the entire cache on every one of the ten ticks per second.
+// Measured at 22.1 ms of blocked ingest per tick on a full 256 MiB cache, and
+// linear in --max-memory from there.
+func TestSnapshotWorkIsBoundedByTheLimitNotByTheCache(t *testing.T) {
+	t.Parallel()
+
+	const (
+		events = 200_000
+		limit  = 100
+	)
+
+	c := cache.New(1 << 30)
+	fill(c, events)
+
+	m := &countingMatcher{pick: func(model.Event) bool { return false }}
+
+	got, scanned := c.Snapshot(m, limit)
+	if len(got) != 0 {
+		t.Fatalf("premise failed: a matcher that matches nothing returned %d events", len(got))
+	}
+
+	// Generous: the point is that the bound exists and is a function of limit,
+	// not that it has one particular value.
+	if m.calls > limit*64 {
+		t.Errorf("a snapshot limited to %d examined %d of %d cached events; "+
+			"render cost must be O(visible rows), not O(cache)", limit, m.calls, events)
+	}
+
+	if scanned != m.calls {
+		t.Errorf("Snapshot reported scanning %d events but examined %d", scanned, m.calls)
+	}
+}
+
+// TestSnapshotWorkDoesNotGrowWithTheCache is the same property stated the way
+// it actually bites: the cost per tick must not get worse as the session runs
+// or as --max-memory is raised.
+func TestSnapshotWorkDoesNotGrowWithTheCache(t *testing.T) {
+	t.Parallel()
+
+	const limit = 100
+
+	work := func(events int) int {
+		c := cache.New(1 << 30)
+		fill(c, events)
+
+		m := &countingMatcher{pick: func(model.Event) bool { return false }}
+		c.Snapshot(m, limit)
+
+		return m.calls
+	}
+
+	small, large := work(50_000), work(500_000)
+
+	if small != large {
+		t.Errorf("a snapshot cost %d examinations over 50,000 events and %d over 500,000; "+
+			"the per-tick cost must not scale with the cache", small, large)
+	}
+}
+
+// TestSnapshotStillFillsTheViewportWhenMatchesAreNear is the other side of the
+// bound: it must not cost the common case anything. A filter that matches
+// recent events still fills the limit.
+func TestSnapshotStillFillsTheViewportWhenMatchesAreNear(t *testing.T) {
+	t.Parallel()
+
+	const limit = 50
+
+	c := cache.New(1 << 30)
+	fill(c, 100_000)
+
+	for range limit {
+		c.Add(event("salt/auth", 8))
+	}
+
+	got, _ := c.Snapshot(matcherFunc(func(e model.Event) bool { return e.Tag == "salt/auth" }), limit)
+	if len(got) != limit {
+		t.Errorf("Snapshot returned %d events, want the full %d", len(got), limit)
+	}
+}
+
+// TestSnapshotReportsHowFarItLooked is what keeps the bound honest.
+//
+// A bounded scan can return nothing while matching events sit deeper in the
+// cache. Silently drawing an empty pane in that case would read as "there are
+// no such events", which is a different and much worse message than "the
+// filter looked back this far" — the same failure the filter parser already
+// refuses to commit (spec §6).
+func TestSnapshotReportsHowFarItLooked(t *testing.T) {
+	t.Parallel()
+
+	c := cache.New(1 << 30)
+	fill(c, 100)
+
+	// Everything matches and everything fits: the scan reached the far end.
+	_, scanned := c.Snapshot(matchAll{}, 1000)
+	if scanned != 100 {
+		t.Errorf("scanned = %d over a 100-event cache with no bound in play, want 100", scanned)
+	}
+
+	// Nothing matches, so the bound stops it short of the far end.
+	_, scanned = c.Snapshot(matcherFunc(func(model.Event) bool { return false }), 2)
+	if scanned >= 100 {
+		t.Errorf("scanned = %d; a selective filter must stop short rather than "+
+			"walking the whole cache", scanned)
+	}
+}
+
+func BenchmarkSnapshotUnderASelectiveFilter(b *testing.B) {
+	// The two sizes are the point: this is the benchmark that catches an
+	// unbounded scan coming back, because an unbounded one costs ten times as
+	// much at 500,000 as at 50,000 and a bounded one costs the same.
+	for _, events := range []int{50_000, 500_000} {
+		b.Run(fmt.Sprintf("%d-events", events), func(b *testing.B) {
+			c := cache.New(1 << 30)
+			fill(c, events)
+
+			q, err := filter.Parse("minion:no-such-minion")
+			if err != nil {
+				b.Fatalf("Parse: %v", err)
+			}
+
+			b.ResetTimer()
+
+			for range b.N {
+				c.Snapshot(q, 2000)
+			}
+		})
 	}
 }

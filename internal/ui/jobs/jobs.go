@@ -82,6 +82,10 @@ const (
 	drillChrome = 6
 )
 
+// keyEnter is the drill key, named because it is bound and advertised in both
+// views and goconst counts the literal.
+const keyEnter = "enter"
+
 // minionColumn is the width the minion name is padded to in the drill-down.
 // Minion IDs are FQDN-shaped and minion-supplied, so anything longer is
 // truncated rather than allowed to push the note off the line.
@@ -93,7 +97,13 @@ type Pane struct {
 
 	drilled string // JID, empty when showing the list
 	view    view
-	offset  int
+
+	// row is the highlighted minion row inside the drill-down. It is a CURSOR,
+	// not a scroll offset: `enter` opens the row it names (spec §7.5), so the
+	// operator has to be able to see which row that is. It is clamped at render
+	// time rather than in Update, because the row count changes underneath it
+	// as returns arrive and as `f` cycles the view.
+	row int
 }
 
 // New returns a Jobs pane.
@@ -117,7 +127,8 @@ func (p *Pane) PinnedJID() string { return p.drilled }
 func (p *Pane) Keys() []ui.KeyHint {
 	if p.drilled != "" {
 		return []ui.KeyHint{
-			{Key: "↑/↓", Label: "scroll"},
+			{Key: "↑/↓", Label: "select minion"},
+			{Key: keyEnter, Label: "open this minion's return in Detail"},
 			{Key: "f", Label: "cycle view (" + p.view.String() + ")"},
 			{Key: "esc", Label: "back to the job list"},
 		}
@@ -125,7 +136,7 @@ func (p *Pane) Keys() []ui.KeyHint {
 
 	return []ui.KeyHint{
 		{Key: "↑/↓", Label: "select job"},
-		{Key: "enter", Label: "drill into job"},
+		{Key: keyEnter, Label: "drill into job"},
 	}
 }
 
@@ -137,7 +148,7 @@ func (p *Pane) Update(msg tea.Msg, s ui.Snapshot) (ui.Pane, tea.Cmd) {
 	}
 
 	if p.drilled != "" {
-		return p.updateDrilled(key), nil
+		return p.updateDrilled(key, s)
 	}
 
 	switch key.String() {
@@ -145,9 +156,9 @@ func (p *Pane) Update(msg tea.Msg, s ui.Snapshot) (ui.Pane, tea.Cmd) {
 		p.cursor = min(p.cursor+1, max(0, len(s.Jobs)-1))
 	case "up", "k":
 		p.cursor = max(p.cursor-1, 0)
-	case "enter":
+	case keyEnter:
 		if p.cursor < len(s.Jobs) {
-			p.drilled, p.view, p.offset = s.Jobs[p.cursor].JID, viewAttention, 0
+			p.drilled, p.view, p.row = s.Jobs[p.cursor].JID, viewAttention, 0
 		}
 	}
 
@@ -155,20 +166,63 @@ func (p *Pane) Update(msg tea.Msg, s ui.Snapshot) (ui.Pane, tea.Cmd) {
 }
 
 // updateDrilled handles keys inside the drill-down.
-func (p *Pane) updateDrilled(key tea.KeyMsg) *Pane {
+func (p *Pane) updateDrilled(key tea.KeyMsg, s ui.Snapshot) (ui.Pane, tea.Cmd) {
 	switch key.String() {
 	case "esc":
 		p.drilled = ""
 	case "f":
 		p.view = (p.view + 1) % viewCount
-		p.offset = 0
+		p.row = 0
 	case "down", "j":
-		p.offset++
+		p.row++
 	case "up", "k":
-		p.offset = max(0, p.offset-1)
+		p.row = max(0, p.row-1)
+	case keyEnter:
+		return p, p.openRow(s)
 	}
 
-	return p
+	return p, nil
+}
+
+// openRow asks the root to open the selected minion's return in the Detail
+// pane (spec §7.5, "enter on a minion row opens that return").
+//
+// The pane cannot do this itself twice over: it cannot reach another pane, and
+// it does not hold events — a job carries only the eagerly extracted fields,
+// never payloads, which is what keeps invariant 9 true. So it names the pair
+// and the root resolves it against the snapshot.
+//
+// A missing row is declined with a reason rather than sent on. "Missing" means
+// the minion never returned, so there is nothing to open, and the root's
+// generic miss message ("it may have aged out of the cache") would send the
+// operator looking for an event that never existed.
+func (p *Pane) openRow(s ui.Snapshot) tea.Cmd {
+	if s.JobLookup == nil {
+		return nil
+	}
+
+	job, lookup := s.JobLookup(p.drilled)
+	if lookup != stats.LookupFound || job == nil {
+		return nil
+	}
+
+	rows := p.rows(job, s.Now)
+	if len(rows) == 0 {
+		return nil
+	}
+
+	sel := rows[min(max(0, p.row), len(rows)-1)]
+
+	if sel.state == stateMissing {
+		return func() tea.Msg {
+			return ui.NoticeMsg(sel.minion + " has not returned for job " + p.drilled +
+				" — there is no return event to open")
+		}
+	}
+
+	jid, minion := p.drilled, sel.minion
+
+	return func() tea.Msg { return ui.OpenJobReturnMsg{JID: jid, Minion: minion} }
 }
 
 // View renders either the list or the drill-down into the w×h CONTENT box.
@@ -222,8 +276,8 @@ func (p *Pane) viewList(w, h int, s ui.Snapshot, st *theme.Styles) string {
 			j.Fun,
 			j.Tgt,
 			retLabel(j),
-			duration(j),
-			strconv.Itoa(j.Failed()),
+			duration(j, s.Now),
+			strconv.Itoa(j.Failed),
 			"",
 		})
 	}
@@ -256,9 +310,9 @@ func indexHeader(is stats.IndexStats, st *theme.Styles) string {
 // max_event_size on the master; "unseen" by attaching sooner or raising
 // --max-jobs. Collapsing them sends the operator after the wrong thing, and
 // printing either as a number would fabricate a denominator (invariant 10).
-func retLabel(j *model.Job) string {
+func retLabel(j model.JobRow) string {
 	n, state := j.ExpectedCount()
-	returned := strconv.Itoa(j.Returned())
+	returned := strconv.Itoa(j.Returned)
 
 	switch state {
 	case model.ExpectedKnown:
@@ -274,12 +328,12 @@ func retLabel(j *model.Job) string {
 
 // expectedNote spells out what the ret column's glyph means, for the
 // drill-down title where there is room for words.
-func expectedNote(j *model.Job) string {
+func expectedNote(j model.JobRow) string {
 	_, state := j.ExpectedCount()
 
 	switch state {
 	case model.ExpectedKnown:
-		if j.Complete() {
+		if j.Complete {
 			return "complete"
 		}
 
@@ -293,18 +347,36 @@ func expectedNote(j *model.Job) string {
 	}
 }
 
-// duration renders elapsed time.
-func duration(j *model.Job) string {
+// duration renders elapsed time: last-return arrival minus job-new arrival,
+// counting up live from the `new` event while the job is still returning
+// (spec §7.5).
+//
+// now is the snapshot's clock reading, taken under the ingest lock from the
+// SAME clock that stamps arrival — never Salt's _stamp, which is set by
+// whichever process fired the event and would make this jump backwards for a
+// skewed minion (invariant 2). A zero now means the snapshot carried no
+// reading, which is every snapshot before the first tick and every one a test
+// builds by hand: the duration then freezes at the last return rather than
+// counting up from 1970.
+//
+// It counts up only while the job is INCOMPLETE. A finished job's duration is
+// a fact about the job, not about how long the operator has been looking at it.
+func duration(j model.JobRow, now time.Time) string {
 	if j.Start.IsZero() {
 		return "—"
 	}
 
 	end := j.LastRet
+
+	if !j.Complete && !now.IsZero() && now.After(end) {
+		end = now
+	}
+
 	if end.IsZero() {
 		end = j.Start
 	}
 
-	d := end.Sub(j.Start)
+	d := max(0, end.Sub(j.Start))
 
 	switch {
 	case d < time.Second:
@@ -348,29 +420,37 @@ func (p *Pane) viewDrilled(w, h int, s ui.Snapshot, st *theme.Styles) string {
 			w))}, w, h)
 	}
 
-	return clamp(p.drillLines(w, h, job, st), w, h)
+	return clamp(p.drillLines(w, h, job, s.Now, st), w, h)
 }
 
 // drillLines assembles the drill-down, chrome first and then the visible slice
 // of the row window.
-func (p *Pane) drillLines(w, h int, job *model.Job, st *theme.Styles) []string {
+func (p *Pane) drillLines(w, h int, job *model.Job, now time.Time, st *theme.Styles) []string {
+	// The drill-down holds a full job — JobLookup cloned exactly this one on
+	// demand — and reduces it to a row only for the header line, which renders
+	// the same three facts the list does and must render them identically.
+	row := job.Row()
+
 	lines := []string{
-		st.Header.Render(fit(truncJID(job.JID)+"  "+job.Fun+"  "+job.Tgt+"  "+
-			duration(job)+"  "+expectedNote(job), w)),
+		st.Header.Render(fit(truncJID(row.JID)+"  "+row.Fun+"  "+row.Tgt+"  "+
+			duration(row, now)+"  "+expectedNote(row), w)),
 		"",
 		counts(job, st),
 		st.Muted.Render(strings.Repeat("─", max(0, w))),
 	}
 
-	rows := p.rows(job)
+	rows := p.rows(job, now)
 
-	// Only the rows on screen are formatted and styled (invariant 6).
+	// Only the rows on screen are formatted and styled (invariant 6). The
+	// window follows the cursor rather than being the cursor: `enter` acts on
+	// the highlighted row, so it must stay visible.
 	window := max(1, h-drillChrome)
-	start := min(p.offset, max(0, len(rows)-1))
+	cursor := min(max(0, p.row), max(0, len(rows)-1))
+	start := scrollStart(cursor, window, len(rows))
 	end := min(start+window, len(rows))
 
-	for _, r := range rows[start:end] {
-		lines = append(lines, renderRow(r, w, st))
+	for i, r := range rows[start:end] {
+		lines = append(lines, renderRow(r, start+i == cursor, w, st))
 	}
 
 	return append(lines, "", st.Muted.Render(fit(
@@ -408,7 +488,7 @@ func counts(job *model.Job, st *theme.Styles) string {
 // The missing half is populated only when model.Missing reports the expected
 // set is known; an unknown set yields no missing rows rather than an empty
 // list that would read as "none missing".
-func (p *Pane) rows(job *model.Job) []row {
+func (p *Pane) rows(job *model.Job, now time.Time) []row {
 	var failed, okRows []row
 
 	// Returns() is already sorted by minion, so the two halves stay sorted.
@@ -429,7 +509,7 @@ func (p *Pane) rows(job *model.Job) []row {
 	var missingRows []row
 
 	if missing, known := job.Missing(); known {
-		note := "no return after " + duration(job)
+		note := "no return after " + duration(job.Row(), now)
 		for _, m := range missing {
 			missingRows = append(missingRows, row{minion: m, state: stateMissing, note: note})
 		}
@@ -471,8 +551,17 @@ func concat(parts ...[]row) []row {
 // is the one job Ok/Warn/Err are reserved for (spec §9). Each also carries a
 // glyph and text, so identity is never colour-alone and the row still reads
 // under the mono palette.
-func renderRow(r row, w int, st *theme.Styles) string {
+//
+// The selected row takes the selection style instead, padded to the full width
+// so the highlight spans the row rather than stopping at the end of the text.
+// Its glyph still carries the status, which is what keeps the row readable
+// under the mono palette where the selection is the only thing colour marks.
+func renderRow(r row, selected bool, w int, st *theme.Styles) string {
 	line := "  " + glyph(r.state) + " " + cell(r.minion, minionColumn) + " " + r.note
+
+	if selected {
+		return st.TableRowSel.Render(components.PadTo(fit(line, w), w))
+	}
 
 	switch r.state {
 	case stateFailed:

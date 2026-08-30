@@ -76,7 +76,7 @@ func bigJob(state model.ExpectedState) *model.Job {
 
 func snapWith(j *model.Job) ui.Snapshot {
 	return ui.Snapshot{
-		Jobs:     []*model.Job{j},
+		Jobs:     []model.JobRow{j.Row()},
 		JobStats: stats.IndexStats{Tracked: 1, Cap: 500},
 		JobLookup: func(string) (*model.Job, stats.Lookup) {
 			return j, stats.LookupFound
@@ -470,15 +470,136 @@ func TestJobsKeysReportWhatIsBoundNow(t *testing.T) {
 	}
 
 	drilled := keyStrings(drill(t, jobs.New(), s).Keys())
-	for _, k := range []string{"f", "esc", "↑/↓"} {
+	for _, k := range []string{"f", "esc", "↑/↓", "enter"} {
 		if !drilled[k] {
 			t.Errorf("the drill-down must advertise %q, got %v", k, drilled)
 		}
 	}
+}
 
-	if drilled["enter"] {
-		t.Error("the drill-down advertises enter but binds nothing to it")
+// TestJobsDrillDownEnterOpensTheSelectedMinionsReturn is the §7.5 drill-through
+// from this side. The pane holds no events — a job carries only the eagerly
+// extracted fields (invariant 9) — so all it can do is name the pair and let
+// the root resolve it against the cache.
+//
+// The cursor is moved first: an assertion on row 0 alone passes just as well
+// for a pane that always opens the first row.
+func TestJobsDrillDownEnterOpensTheSelectedMinionsReturn(t *testing.T) {
+	t.Parallel()
+
+	s := snapWith(bigJob(model.ExpectedKnown))
+
+	// The default view is needs-attention, which puts the 23 failed minions
+	// first, sorted: web-0000, web-0001, …
+	p := drill(t, jobs.New(), s)
+	p, _ = p.Update(tea.KeyMsg{Type: tea.KeyDown}, s)
+
+	_, cmd := p.Update(tea.KeyMsg{Type: tea.KeyEnter}, s)
+	if cmd == nil {
+		t.Fatal("enter on a minion row returned no command: the drill-through is unbound")
 	}
+
+	open, ok := cmd().(ui.OpenJobReturnMsg)
+	if !ok {
+		t.Fatalf("enter emitted %T, want ui.OpenJobReturnMsg", cmd())
+	}
+
+	if open.Minion != "web-0001" {
+		t.Errorf("enter opened %q, want the selected row web-0001", open.Minion)
+	}
+
+	if open.JID != "20260830081402123456" {
+		t.Errorf("enter named job %q, want the drilled JID", open.JID)
+	}
+}
+
+// TestJobsDrillDownEnterOnAMissingMinionDeclinesWithAReason: a missing minion
+// never returned, so there is nothing to open. Emitting the ordinary open
+// message would make the root report "it may have aged out of the cache",
+// sending the operator to look for an event that never existed.
+func TestJobsDrillDownEnterOnAMissingMinionDeclinesWithAReason(t *testing.T) {
+	t.Parallel()
+
+	s := snapWith(bigJob(model.ExpectedKnown))
+
+	// attention → failed → missing.
+	p := press(press(drill(t, jobs.New(), s), s, 'f'), s, 'f')
+
+	_, cmd := p.Update(tea.KeyMsg{Type: tea.KeyEnter}, s)
+	if cmd == nil {
+		t.Fatal("enter on a missing row returned no command, so the key silently does nothing")
+	}
+
+	msg := cmd()
+
+	if _, wrong := msg.(ui.OpenJobReturnMsg); wrong {
+		t.Fatal("enter on a missing minion asked the root to open a return that never existed")
+	}
+
+	notice, ok := msg.(ui.NoticeMsg)
+	if !ok {
+		t.Fatalf("enter emitted %T, want ui.NoticeMsg", msg)
+	}
+
+	// web-0812 is the first minion with no return: 1000 expected, 812 returned.
+	if !strings.Contains(string(notice), "web-0812") {
+		t.Errorf("the notice does not name the minion: %q", notice)
+	}
+}
+
+// TestJobsDurationCountsUpFromTheSnapshotClock is spec §7.5's live `dur`, and
+// invariant 2's edge of it: the reading comes from the snapshot's arrival-side
+// clock, never from anything a minion sent.
+func TestJobsDurationCountsUpFromTheSnapshotClock(t *testing.T) {
+	t.Parallel()
+
+	job := bigJob(model.ExpectedKnown) // 812 of 1000 returned: still running
+	s := snapWith(job)
+
+	// LastRet is Start + 811ms, so a frozen duration reads well under a second.
+	frozen := jobs.New().View(120, 24, s, styles(t))
+	if !strings.Contains(frozen, "811ms") {
+		t.Fatalf("premise failed: a clockless snapshot should freeze dur at the last return:\n%s",
+			firstTableRow(frozen))
+	}
+
+	s.Now = job.Start.Add(4*time.Minute + 12*time.Second)
+
+	live := jobs.New().View(120, 24, s, styles(t))
+	if !strings.Contains(live, "4m12s") {
+		t.Errorf("dur did not count up to the snapshot clock:\n%s", firstTableRow(live))
+	}
+}
+
+// TestJobsDurationOfAFinishedJobDoesNotCountUp: a completed job's duration is a
+// fact about the job, not about how long the operator has been looking at it.
+func TestJobsDurationOfAFinishedJobDoesNotCountUp(t *testing.T) {
+	t.Parallel()
+
+	job := model.NewJob("20260830081402123456")
+	job.Fun = "test.ping"
+	job.ExpectedState = model.ExpectedKnown
+	job.Start = time.Date(2026, 8, 30, 8, 14, 2, 0, time.UTC)
+	job.AddExpected("web-1")
+	job.AddReturn(model.RetInfo{Minion: "web-1", Success: true, Arrival: job.Start.Add(1500 * time.Millisecond)})
+
+	s := snapWith(job)
+	s.Now = job.Start.Add(time.Hour)
+
+	got := jobs.New().View(120, 24, s, styles(t))
+	if !strings.Contains(got, "1.5s") {
+		t.Errorf("a complete job's dur moved with the clock:\n%s", firstTableRow(got))
+	}
+}
+
+// firstTableRow is the job row, for a readable failure message.
+func firstTableRow(view string) string {
+	lines := strings.Split(view, "\n")
+	if len(lines) < 3 {
+		return view
+	}
+
+	return strings.Join(lines[:3], "\n")
 }
 
 // firstLine is the pane's own header row, without the table below it.

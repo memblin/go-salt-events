@@ -2,22 +2,17 @@
 
 // This file is compiled only under -tags=integration and needs a live Salt
 // master. On any host without one it SKIPS, and a skip verifies nothing —
-// see the skip messages, which say so in as many words.
+// see the skip messages, which say so in as many words, and see
+// integration_test.go for how to turn those skips into failures.
 package saltipc_test
 
 import (
 	"context"
-	"os"
 	"testing"
 	"time"
 
-	"github.com/TKC-Labs/go-salt-events/internal/config"
 	"github.com/TKC-Labs/go-salt-events/internal/saltipc"
 )
-
-// sockDirEnv overrides where the integration test looks for the socket, for a
-// master whose sock_dir Salt relocated (spec §2.6).
-const sockDirEnv = "SALTEV_SOCK_DIR"
 
 // integrationWindow is how long we sit on the real bus. Long enough that a
 // busy master will produce something, short enough to stay a test.
@@ -35,19 +30,14 @@ const integrationWindow = 10 * time.Second
 // Run it on the master with:
 //
 //	sudo -E go test -tags=integration -count=1 -run Integration ./internal/saltipc/
+//
+// Add SALT_EVENTS_REQUIRE_BUS=1 to assert that the bus really is there, which
+// turns "no master, skipped" into a failure.
 func TestIntegrationReaderReadsTheRealPublishSocket(t *testing.T) {
-	sockDir := os.Getenv(sockDirEnv)
-	if sockDir == "" {
-		sockDir = config.DefaultSockDir
-	}
-
-	reader := saltipc.NewReader(sockDir, time.Now)
-
-	if _, err := os.Stat(reader.SocketPath()); err != nil {
-		t.Skipf("SKIPPED, NOTHING VERIFIED: no live Salt master here — %s is not readable (%v).\n%s",
-			reader.SocketPath(), err,
-			saltipc.Diagnose(reader.SocketPath(), err))
-	}
+	// Skips (or, under SALT_EVENTS_REQUIRE_BUS, fails) when the socket is
+	// absent or unreadable. Both are ordinary — no master here, or no sudo —
+	// and neither is this test's news to break.
+	reader := requireLiveBus(t)
 
 	sink := newRecordSink(1)
 
