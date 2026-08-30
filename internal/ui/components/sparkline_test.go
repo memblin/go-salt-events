@@ -27,29 +27,25 @@ func TestMain(m *testing.M) {
 
 // styles returns compiled styles for a REGISTERED palette.
 //
-// This is the ONLY place in the package that compiles a palette, and it is
-// fed only from theme.Get, so the palette under test is one the contrast
-// suite already validates by iterating theme.Names(). A hand-built palette —
-// struct literal, zero value, or mutated copy — would be structurally
-// invisible to that validation and must never appear here.
+// It goes through theme.StylesFor, which sources its palette from the registry
+// and is now the only route to a *theme.Styles from outside internal/theme:
+// theme.compile is unexported, so a hand-built palette — struct literal, zero
+// value, or mutated copy — can no longer be compiled at all. That matters
+// because such a palette would never reach the contrast suite, which iterates
+// theme.Names(), so an unreadable component could ship with no failing test
+// (spec §3.2).
 //
-// The compile call cannot currently be avoided: theme exposes no
-// name-to-Styles constructor, and a zero-value Styles renders every row
-// identically, which would make TestTableSelectionIsVisible untestable.
-// A theme.StylesFor(name) (*Styles, bool) helper would let this line go away
-// and let the ban be tightened to cover tests as well.
-//
-// The components themselves never compile a palette and never name the
-// Palette type: they receive *theme.Styles as a parameter and nothing more.
+// The components themselves never obtain styles at all: they receive
+// *theme.Styles as a parameter and nothing more.
 func styles(t *testing.T) *theme.Styles {
 	t.Helper()
 
-	p, ok := theme.Get("gruvbox-dark")
+	st, ok := theme.StylesFor("gruvbox-dark")
 	if !ok {
 		t.Fatal("gruvbox-dark palette missing")
 	}
 
-	return theme.Compile(p)
+	return st
 }
 
 func TestSparklineRendersExactlyWidthCells(t *testing.T) {
