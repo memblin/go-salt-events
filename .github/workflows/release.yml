@@ -122,20 +122,20 @@ jobs:
       # successful build, which sends you looking at the wrong thing.
       - name: Check publish preconditions
         env:
-          GITEA_TOKEN: ${{ secrets.PACKAGING_GITEA_TOKEN }}
+          TOKEN: ${{ secrets.PACKAGING_GITEA_TOKEN }}
         run: |
           fail=0
 
-          if ! command -v tea >/dev/null 2>&1; then
-            echo "::error::tea is not installed on this runner. Install it (https://gitea.com/gitea/tea) or switch the publish step to the releases API."
-            fail=1
-          else
-            tea --version
-          fi
+          for tool in curl python3; do
+            if ! command -v "${tool}" >/dev/null 2>&1; then
+              echo "::error::${tool} is not installed on this runner; the publish step needs it."
+              fail=1
+            fi
+          done
 
           # Presence only — never echo the value, and never echo its length,
           # which leaks information about the credential for no benefit.
-          if [[ -z "${GITEA_TOKEN}" ]]; then
+          if [[ -z "${TOKEN}" ]]; then
             echo "::error::The organisation secret PACKAGING_GITEA_TOKEN is unset or empty for this repository. Releases cannot be published without it."
             fail=1
           fi
@@ -166,33 +166,62 @@ jobs:
       - name: List artefacts
         run: ls -l dist/ && cat dist/sha256sums.txt
 
+      # Published through the releases API with curl rather than through tea.
+      #
+      # tea is installed on the runners, but it does NOT read a token from the
+      # environment for API calls: GITEA_SERVER_URL/GITEA_SERVER_TOKEN feed
+      # `tea logins add`, and `tea release create` then uses the login it
+      # PERSISTED to ~/.config/tea/config.yml. Making tea work here would mean
+      # writing the packaging token to disk on a shared self-hosted runner and
+      # remembering to delete it afterwards, including on every failure path.
+      # curl holds the credential in the process environment for the length of
+      # one request and leaves nothing behind.
+      #
+      # The token is passed via --header @- on stdin, never on the command line,
+      # so it cannot appear in `ps` output on a shared runner.
       - name: Publish release
         env:
-          # tea reads the token from GITEA_TOKEN in the environment. The value
-          # comes from the ORGANISATION-level secret PACKAGING_GITEA_TOKEN, not
-          # from the ephemeral job token, which cannot reliably create releases
-          # on self-hosted Gitea.
-          #
-          # The names differ on purpose and should stay that way: the secret is
-          # named for what it is FOR, so it reads sensibly across every repo in
-          # the org that publishes packages, while the environment variable is
-          # named for what tea REQUIRES. Renaming the secret to GITEA_TOKEN
-          # would make it look like a generic credential and invite reuse for
-          # things that are not packaging.
-          GITEA_TOKEN: ${{ secrets.PACKAGING_GITEA_TOKEN }}
+          TOKEN: ${{ secrets.PACKAGING_GITEA_TOKEN }}
           TAG: ${{ steps.version.outputs.tag }}
           REPO: ${{ github.repository }}
+          API: ${{ github.server_url }}/api/v1
         run: |
           set -euo pipefail
 
-          assets=()
+          auth_header() { printf 'Authorization: token %s\n' "${TOKEN}"; }
+
+          # Built by python rather than by string interpolation so the note and
+          # the tag are JSON-escaped rather than trusted to be quote-free. Kept
+          # to ONE line: an unindented line inside this block scalar silently
+          # ends it and produces a YAML parse error far from the real cause.
+          #
+          # The tag already exists (this workflow is triggered BY it), so the
+          # release attaches to it. Anything with -rc or -beta in the tag is
+          # marked prerelease, so a pipeline test cannot present itself as a
+          # real release.
+          export NOTE="Automated release of ${TAG}. See the commit log for changes."
+          body=$(python3 -c 'import json,os;t=os.environ["TAG"];print(json.dumps({"tag_name":t,"name":t,"body":os.environ["NOTE"],"draft":False,"prerelease":("-rc" in t or "-beta" in t)}))')
+
+          echo "Creating release ${TAG}"
+          resp=$(auth_header | curl -sS --fail-with-body \
+            -X POST "${API}/repos/${REPO}/releases" \
+            -H @- \
+            -H "Content-Type: application/json" \
+            -d "${body}")
+
+          release_id=$(printf '%s' "${resp}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+          echo "Release id ${release_id}"
+
           for f in dist/*.tar.gz dist/*.deb dist/*.rpm dist/sha256sums.txt; do
-            assets+=(--asset "${f}")
+            name=$(basename "${f}")
+            echo "Uploading ${name}"
+            # --fail-with-body so a rejected upload prints the server's reason
+            # and stops the run, rather than silently producing a release with
+            # some of its assets missing.
+            auth_header | curl -sS --fail-with-body -o /dev/null \
+              -X POST "${API}/repos/${REPO}/releases/${release_id}/assets?name=${name}" \
+              -H @- \
+              -F "attachment=@${f}"
           done
 
-          tea release create \
-            --repo "${REPO}" \
-            --tag "${TAG}" \
-            --title "${TAG}" \
-            --note "See CHANGELOG or the commit log for changes in ${TAG}." \
-            "${assets[@]}"
+          echo "Published ${TAG} with $(ls -1 dist/*.tar.gz dist/*.deb dist/*.rpm dist/sha256sums.txt | wc -l) assets"
