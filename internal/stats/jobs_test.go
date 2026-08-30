@@ -170,6 +170,201 @@ func TestJobIndexNeverEvictsAnIncompleteJob(t *testing.T) {
 	}
 }
 
+func TestJobIndexEvictsAJobThatCanNeverCompleteBeforeOneStillReturning(t *testing.T) {
+	t.Parallel()
+
+	// Spec §7.5's own worked example, put under pressure: an 812/847
+	// state.apply still receiving returns — "the one most likely being
+	// watched" — alongside orphan returns for jobs whose `new` event we never
+	// saw.
+	//
+	// The orphans' denominator is unknown, so Complete() can never become true
+	// for them: they are dead weight the index would otherwise hold forever,
+	// and they are the population the eviction fallback exists for. The big job
+	// is progressing toward completion and §7.5 protects it absolutely.
+	//
+	// Eviction order is first observation, so the big job sits nearest the
+	// front of the list. A fallback that reaches only for "oldest incomplete"
+	// therefore picks the big job first and lets three single-return orphans
+	// survive — the exact inversion of the documented policy.
+	const (
+		bigJID    = "20260830081402847000"
+		targets   = 847
+		returning = 812
+		orphans   = 3
+	)
+
+	idx := stats.NewJobIndex(3, 1<<30, stats.NewFakeClock(time.Now()))
+
+	published := newEvent(model.KindNew, bigJID, "", 0, true)
+	published.Fun = "state.apply"
+	idx.Observe(published, largeJobTargets(targets), false)
+
+	for i := range returning {
+		idx.Observe(newEvent(model.KindRet, bigJID, largeJobMinion(i), 0, true), nil, false)
+	}
+
+	orphanJIDs := make([]string, 0, orphans)
+
+	for i := range orphans {
+		jid := fmt.Sprintf("2026083008140285000%d", i)
+		orphanJIDs = append(orphanJIDs, jid)
+
+		idx.Observe(newEvent(model.KindRet, jid, "web-1", 0, true), nil, false)
+	}
+
+	// The job being watched must still be there, and still be answerable in
+	// full: 812/847 with the missing set intact, not a survivor in name only.
+	job, lookup := idx.Job(bigJID)
+	if lookup != stats.LookupFound {
+		t.Fatalf("lookup for the 812/847 job = %v, want LookupFound — a job still "+
+			"receiving returns was evicted while orphans that can never complete survived", lookup)
+	}
+
+	if got := job.Returned(); got != returning {
+		t.Errorf("Returned() = %d, want %d", got, returning)
+	}
+
+	n, state := job.ExpectedCount()
+	if state != model.ExpectedKnown || n != targets {
+		t.Errorf("ExpectedCount() = %d, %v; want %d, ExpectedKnown", n, state, targets)
+	}
+
+	if missing, ok := job.Missing(); !ok || len(missing) != targets-returning {
+		t.Errorf("Missing() = %d entries, ok=%v; want %d, true", len(missing), ok, targets-returning)
+	}
+
+	// The bound was still enforced — the victim was simply the right one.
+	if _, lookup := idx.Job(orphanJIDs[0]); lookup != stats.LookupEvicted {
+		t.Errorf("lookup for the oldest orphan = %v, want LookupEvicted — the "+
+			"never-completable job should have been taken first", lookup)
+	}
+
+	got := idx.Stats()
+	if got.Tracked > got.Cap {
+		t.Errorf("Tracked = %d with Cap = %d; the index is not bounded", got.Tracked, got.Cap)
+	}
+
+	if got.Evicted != 1 {
+		t.Errorf("Evicted = %d, want 1 — exactly one job was over the cap", got.Evicted)
+	}
+}
+
+func TestJobIndexStaysBoundedWhenEveryJobIsStillProgressing(t *testing.T) {
+	t.Parallel()
+
+	// The other side of the preference. Protecting progressing jobs must not
+	// become an unbounded index: when every tracked job is ExpectedKnown and
+	// still returning, and there is genuinely nothing else to take, the oldest
+	// progressing job is evicted as a last resort. An eviction is counted,
+	// reported, and answered honestly by Job(); an OOM is silent (spec §7.5).
+	idx := stats.NewJobIndex(2, 1<<20, stats.NewFakeClock(time.Now()))
+
+	for i := range 10 {
+		jid := fmt.Sprintf("2026083008140286000%d", i)
+
+		idx.Observe(newEvent(model.KindNew, jid, "", 0, true), []string{"web-1", "web-2"}, false)
+		idx.Observe(newEvent(model.KindRet, jid, "web-1", 0, true), nil, false)
+	}
+
+	got := idx.Stats()
+
+	if got.Tracked > got.Cap {
+		t.Errorf("Tracked = %d with Cap = %d; the index is not bounded", got.Tracked, got.Cap)
+	}
+
+	if got.Evicted == 0 {
+		t.Error("Evicted = 0; the count bound was silently abandoned rather than enforced")
+	}
+}
+
+func TestJobIndexResurrectedJobReportsAnUnknownDenominator(t *testing.T) {
+	t.Parallel()
+
+	// Invariant 10 at the seam eviction creates. A return arriving after its
+	// job was evicted recreates that job from scratch, with none of the
+	// expected set it once had. It must say "unknown", never carry forward or
+	// invent a denominator — "0 missing" reads as "everything returned".
+	idx := stats.NewJobIndex(1, 1<<20, stats.NewFakeClock(time.Now()))
+
+	idx.Observe(newEvent(model.KindRet, "20260830081402870000", "web-1", 0, true), nil, false)
+	idx.Observe(newEvent(model.KindRet, "20260830081402870001", "web-1", 0, true), nil, false)
+
+	if _, lookup := idx.Job("20260830081402870000"); lookup != stats.LookupEvicted {
+		t.Fatalf("premise failed: lookup = %v, want LookupEvicted", lookup)
+	}
+
+	idx.Observe(newEvent(model.KindRet, "20260830081402870000", "web-2", 0, true), nil, false)
+
+	job, lookup := idx.Job("20260830081402870000")
+	if lookup != stats.LookupFound {
+		t.Fatalf("lookup after resurrection = %v, want LookupFound", lookup)
+	}
+
+	if _, state := job.ExpectedCount(); state != model.ExpectedUnseen {
+		t.Errorf("ExpectedState = %v, want ExpectedUnseen", state)
+	}
+
+	if _, ok := job.Missing(); ok {
+		t.Error("Missing() reported ok=true for a resurrected job; the denominator is not known")
+	}
+}
+
+func TestJobIndexSecondNewDoesNotDowngradeAKnownDenominator(t *testing.T) {
+	t.Parallel()
+
+	// Spec §5.3 case B. A re-published job/new carrying the trim marker must
+	// not turn an actionable 812/847 into 812/⚠: we already know the answer,
+	// and a later sighting losing it is a downgrade, not new information.
+	idx := stats.NewJobIndex(100, 1<<20, stats.NewFakeClock(time.Now()))
+
+	idx.Observe(newEvent(model.KindNew, "20260830081402880000", "", 0, true),
+		[]string{"web-1", "web-2", "web-3"}, false)
+	idx.Observe(newEvent(model.KindNew, "20260830081402880000", "", 0, true), nil, true)
+
+	job, _ := idx.Job("20260830081402880000")
+
+	n, state := job.ExpectedCount()
+	if state != model.ExpectedKnown || n != 3 {
+		t.Errorf("ExpectedCount() = %d, %v; want 3, ExpectedKnown", n, state)
+	}
+
+	if _, ok := job.Missing(); !ok {
+		t.Error("Missing() ok = false; a known denominator was downgraded to unknown")
+	}
+}
+
+func TestJobIndexSecondNewDoesNotBlankFunOrRestartTheClock(t *testing.T) {
+	t.Parallel()
+
+	// `dur` is last-return arrival minus job-new arrival (spec §7.5). A second
+	// sighting re-stamping Start resets that column mid-job, and an empty `fun`
+	// on the later event blanks a name the first sighting (or a return) taught
+	// us.
+	start := time.Date(2026, 8, 30, 8, 14, 2, 0, time.UTC)
+
+	idx := stats.NewJobIndex(100, 1<<20, stats.NewFakeClock(time.Now()))
+
+	first := newEvent(model.KindNew, "20260830081402890000", "", 0, true)
+	first.Fun = "state.apply"
+	first.Arrival = start
+	idx.Observe(first, []string{"web-1"}, false)
+
+	second := newEvent(model.KindNew, "20260830081402890000", "", 0, true)
+	second.Arrival = start.Add(time.Hour)
+	idx.Observe(second, nil, false)
+
+	job, _ := idx.Job("20260830081402890000")
+
+	if job.Fun != "state.apply" {
+		t.Errorf("Fun = %q, want state.apply — a later sighting blanked it", job.Fun)
+	}
+
+	if !job.Start.Equal(start) {
+		t.Errorf("Start = %v, want %v — a later sighting restarted the dur column", job.Start, start)
+	}
+}
+
 func TestJobIndexNeverEvictsThePinnedJob(t *testing.T) {
 	t.Parallel()
 

@@ -40,10 +40,17 @@ func (l Lookup) String() string {
 // than sufficient: the design's job is not to guess the right number but to
 // make a wrong one visible so it can be tuned from evidence (spec §7.5).
 type IndexStats struct {
-	Tracked   int
-	Cap       int
+	Tracked int
+	Cap     int
+
+	// HighWater is the most jobs ever tracked at once. Note it is recorded on
+	// insertion, before eviction runs, so once the index has saturated it
+	// clamps at Cap+1 and says only "saturated", not how much headroom was
+	// actually needed. The unmet demand above the cap is not observable from
+	// inside a bounded index; Evicted is the number that quantifies it.
 	HighWater int
-	Evicted   uint64
+
+	Evicted uint64
 }
 
 // perMinionBytes is a rough accounting weight for the memory ceiling: one
@@ -129,6 +136,14 @@ func NewJobIndex(maxJobs int, memCeiling int64, c Clock) *JobIndex {
 // Both are supplied by the caller because decoding belongs at the ingest
 // boundary, not here (invariant 4).
 //
+// The nil-versus-empty distinction in expected is load-bearing and the caller
+// MUST honour it: nil means "we do not know" and leaves the denominator
+// unknown, whereas an empty non-nil slice means "the master told us: none" and
+// is recorded as a confident zero. A decoder that turns an absent `minions`
+// key into []string{} rather than nil therefore produces exactly the
+// fabricated "0 missing" — which reads as "everything returned" — that
+// invariant 10 exists to prevent.
+//
 // It reads ONLY indexed fields — never a cached payload. That is what keeps
 // invariant 9 true: shedding payloads cannot change a job count.
 func (idx *JobIndex) Observe(e model.Event, expected []string, expectedTrimmed bool) {
@@ -152,14 +167,28 @@ func (idx *JobIndex) observeNew(e model.Event, expected []string, expectedTrimme
 	el := idx.touch(e.JID)
 	job := entryOf(el).job
 
-	job.Fun = e.Fun
-	job.Start = e.Arrival
+	// Every field below is written only when it adds information. A second
+	// sighting of the same job must never take any of them away: an empty
+	// `fun` would blank a name a return already taught us (see observeRet),
+	// and re-stamping Start would restart the `dur` column mid-job, which
+	// spec §7.5 defines as last-return arrival minus job-new arrival.
+	if e.Fun != "" {
+		job.Fun = e.Fun
+	}
 
-	// A `new` event that carries neither a list nor a trim marker leaves the
-	// state alone: a second sighting of the same job must never downgrade a
-	// known denominator back to unknown (spec §5.3 case B).
+	// Only a `new` event sets Start, so a zero value means no `new` has been
+	// seen yet — this is the first, and it is the authoritative one.
+	if job.Start.IsZero() {
+		job.Start = e.Arrival
+	}
+
+	// Same rule for the denominator, which is the one that matters most: a
+	// `new` carrying neither a list nor a trim marker leaves the state alone,
+	// and neither does a trim marker arriving after we already learned the
+	// real list. Downgrading a known 812/847 to 812/⚠ discards an answer we
+	// hold for one we do not (spec §5.3 case B).
 	switch {
-	case expectedTrimmed:
+	case expectedTrimmed && job.ExpectedState != model.ExpectedKnown:
 		job.ExpectedState = model.ExpectedTrimmed
 
 	case expected != nil:
@@ -266,39 +295,60 @@ func (idx *JobIndex) overCapacity() bool {
 	return idx.memCeiling > 0 && idx.bytes > idx.memCeiling
 }
 
-// oldestEvictable picks a victim: the oldest complete job, or — only when no
-// complete job exists at all — the oldest incomplete one. The pinned job is
-// never a victim.
+// oldestEvictable picks a victim in three tiers of preference, oldest first
+// within each. The pinned job is never a victim.
 //
-// The preference for complete jobs is spec §7.5: a job still receiving returns
-// is the one most likely being watched. The fallback exists because
-// Job.Complete() is false whenever the expected set is unknown, and attaching
-// to a busy master mid-stream produces nothing but such jobs — every in-flight
-// job's `new` event is already gone. Without the fallback that ordinary case
-// would make --max-jobs and the ceiling unenforceable and grow the index
-// without bound, which is a worse outcome than evicting: an eviction is
-// counted, reported in IndexStats, and answered honestly by Job() as
-// LookupEvicted, whereas an OOM is silent.
+//  1. a complete job — nothing more will arrive for it;
+//  2. else a job that can NEVER complete (the expected set is unknown, so
+//     Job.Complete() is false forever however many returns arrive);
+//  3. else, as a last resort, a job actively progressing toward completion.
+//
+// Spec §7.5 says a job still receiving returns is never evicted: it is the one
+// most likely being watched. Tiers 1 and 2 are what make that true in every
+// case the spec describes. Tier 2 exists because attaching to a busy master
+// mid-stream produces nothing but jobs whose `new` event is already gone —
+// were those protected as "incomplete", --max-jobs and the ceiling would be
+// unenforceable and the index would grow without bound.
+//
+// Distinguishing tiers 2 and 3 is the whole point: an unknown denominator is
+// dead weight the index would hold forever, while an 812/847 state.apply is
+// exactly what §7.5 protects. Collapsing them evicts the big job first, since
+// eviction order is first observation and the long-running job sits nearest
+// the front.
+//
+// Tier 3 keeps the bound hard. When every unpinned job is still progressing,
+// something must give, and an eviction is the honest failure: it is counted,
+// reported in IndexStats, and answered by Job() as LookupEvicted — whereas an
+// OOM is silent. Because tier 2 is precisely the population that grows without
+// bound, tier 3 should essentially never fire in practice.
 func (idx *JobIndex) oldestEvictable() *list.Element {
-	var fallback *list.Element
+	var neverCompletable, progressing *list.Element
 
 	for el := idx.order.Front(); el != nil; el = el.Next() {
 		job := entryOf(el).job
 
-		if job.JID == idx.pinned {
-			continue
-		}
-
-		if job.Complete() {
+		switch {
+		case job.JID == idx.pinned:
+		case job.Complete():
 			return el
-		}
 
-		if fallback == nil {
-			fallback = el
+		case job.ExpectedState != model.ExpectedKnown:
+			if neverCompletable == nil {
+				neverCompletable = el
+			}
+
+		default:
+			if progressing == nil {
+				progressing = el
+			}
 		}
 	}
 
-	return fallback
+	if neverCompletable != nil {
+		return neverCompletable
+	}
+
+	return progressing
 }
 
 // drop removes one job from the index and records the eviction.
