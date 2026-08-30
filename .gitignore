@@ -1,0 +1,10 @@
+# Superpowers design docs — local only, never committed.
+/docs-extra/superpowers/
+
+# Build output
+/salt-events
+/dist/
+/site/
+
+# Local env
+.envrc
