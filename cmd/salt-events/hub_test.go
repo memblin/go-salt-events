@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -205,11 +206,14 @@ func TestSnapshotJobsAreNotAliasedIntoTheIndex(t *testing.T) {
 		for range 1000 {
 			snap := h.Snapshot(filter.Query{}, 50)
 
-			// Everything a pane does with a job, off the ingest goroutine.
-			for _, job := range snap.Jobs {
-				_ = job.Failed()
-				_ = job.Returns()
-				_, _ = job.Missing()
+			// Everything a pane does with a job, off the ingest goroutine. The
+			// list reads rows; the drill-down reads the one job JobLookup
+			// clones, which is the path that still hands out maps.
+			for _, row := range snap.Jobs {
+				_ = row.Failed
+				_ = row.Returned
+				_ = row.Complete
+				_, _ = row.ExpectedCount()
 			}
 
 			if snap.JobLookup == nil {
@@ -218,6 +222,8 @@ func TestSnapshotJobsAreNotAliasedIntoTheIndex(t *testing.T) {
 
 			if job, lookup := snap.JobLookup(testJID); lookup == stats.LookupFound {
 				_ = job.Returns()
+				_, _ = job.Missing()
+				_ = job.Failed()
 			}
 		}
 	}()
@@ -230,13 +236,13 @@ func TestSnapshotJobsAreNotAliasedIntoTheIndex(t *testing.T) {
 		t.Fatalf("the snapshot lists %d jobs, want 1", len(snap.Jobs))
 	}
 
-	before := snap.Jobs[0].Returned()
+	before := snap.Jobs[0].Returned
 
 	feedData(t, fake, h, "salt/job/"+testJID+"/ret/late-1", map[string]any{
 		"jid": testJID, "id": "late-1", "success": true, "return": true,
 	})
 
-	if after := snap.Jobs[0].Returned(); after != before {
+	if after := snap.Jobs[0].Returned; after != before {
 		t.Errorf("a job in an already-taken snapshot grew from %d to %d returns", before, after)
 	}
 }
@@ -708,29 +714,50 @@ func TestDrillThroughReachesTheDetailPane(t *testing.T) {
 	}
 }
 
-// TestTheJobCopyCacheStaysBoundedWhileNothingSnapshots: the dirty set is
-// emptied by a snapshot, and a PAUSED console takes none — invariant 7 keeps
-// ingest running the whole time. Unbounded, that is a slow leak that only
-// appears when an operator pauses during exactly the storm they paused to read.
-func TestTheJobCopyCacheStaysBoundedWhileNothingSnapshots(t *testing.T) {
+// TestIngestAccumulatesNothingBetweenSnapshots is invariant 7's slow half.
+//
+// A PAUSED console takes no snapshots while ingest keeps running, so anything
+// the ingest path accumulates for the benefit of the NEXT snapshot grows for as
+// long as the pause lasts — a leak that only appears when an operator pauses
+// during exactly the storm they paused to read, and a first-snapshot-after-the-
+// pause that costs more the longer they waited. The hub used to keep a dirty
+// set and a clone cache and had to bound them explicitly; it keeps neither now,
+// and this pins that rather than the bound: the first snapshot after 5,000
+// un-snapshotted jobs must cost what one after 200 costs.
+func TestIngestAccumulatesNothingBetweenSnapshots(t *testing.T) {
 	t.Parallel()
 
-	h, _ := newTestHub(t, 1<<20, 5000)
-	fake := saltipc.NewFake(start)
+	feedJobs := func(n int) *hub {
+		h, _ := newTestHub(t, 1<<24, 10000)
+		fake := saltipc.NewFake(start)
 
-	for i := range 2000 {
-		jid := fmt.Sprintf("2026083008%010d", i)
-		feedData(t, fake, h, "salt/job/"+jid+"/new", map[string]any{
-			"jid": jid, "fun": "test.ping", "minions": []any{"web-1"},
-		})
+		for i := range n {
+			jid := fmt.Sprintf("2026083008%010d", i)
+			feedData(t, fake, h, "salt/job/"+jid+"/new", map[string]any{
+				"jid": jid, "fun": "test.ping", "minions": []any{"web-1"},
+			})
+		}
+
+		return h
 	}
 
-	if got := len(h.jobDirty); got > listJobs {
-		t.Errorf("the dirty set holds %d jobs after 2000 arrived with no snapshot, want at most %d",
-			got, listJobs)
+	brief := firstSnapshotAllocBytes(t, feedJobs(listJobs))
+	longPause := firstSnapshotAllocBytes(t, feedJobs(5000))
+
+	if brief == 0 {
+		t.Fatal("premise failed: a snapshot allocated nothing at all")
 	}
 
-	// And it still hands out correct, un-aliased copies afterwards.
+	if longPause > 2*brief {
+		t.Errorf("the first snapshot after 5000 un-snapshotted jobs allocates %d bytes "+
+			"against %d after %d — ingest is accumulating per-job state for a "+
+			"snapshot that a paused console may never take",
+			longPause, brief, listJobs)
+	}
+
+	// And it still hands out correct rows afterwards.
+	h := feedJobs(2000)
+
 	snap := h.Snapshot(filter.Query{}, 10)
 	if len(snap.Jobs) != listJobs {
 		t.Errorf("the snapshot lists %d jobs, want %d", len(snap.Jobs), listJobs)
@@ -739,6 +766,24 @@ func TestTheJobCopyCacheStaysBoundedWhileNothingSnapshots(t *testing.T) {
 	if len(snap.Jobs) > 0 && snap.Jobs[0].Fun != "test.ping" {
 		t.Errorf("the newest listed job is %+v, want a test.ping", snap.Jobs[0])
 	}
+}
+
+// firstSnapshotAllocBytes reports the bytes the very FIRST snapshot a hub takes
+// allocates. Unlike snapshotAllocBytes it runs no warm-up, because the state
+// being measured is precisely what ingest built up before any snapshot ran.
+func firstSnapshotAllocBytes(tb testing.TB, h *hub) uint64 {
+	tb.Helper()
+
+	var before, after runtime.MemStats
+
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+
+	h.Snapshot(filter.Query{}, 10)
+
+	runtime.ReadMemStats(&after)
+
+	return after.TotalAlloc - before.TotalAlloc
 }
 
 // benchHub fills a hub with n events through the real ingest path.
@@ -821,5 +866,322 @@ func BenchmarkHubExportHoldsTheIngestLockOnlyForTheCopy(b *testing.B) {
 				h.AllEvents(q)
 			}
 		})
+	}
+}
+
+// jobsHub fills a hub with jobs jobs, each announcing minions targets and
+// having every one of them return, through the REAL ingest path.
+//
+// It is the shape that makes the ingest lock expensive: an orchestration-heavy
+// master with many simultaneous fleet-wide jobs. Every job is left dirty,
+// because that is the state a busy master is permanently in.
+func jobsHub(tb testing.TB, jobs, minions int) *hub {
+	tb.Helper()
+
+	h := newHub(hubConfig{
+		MaxMemory: 1 << 30, MaxJobs: 5000,
+		Clock: stats.NewFakeClock(start), Decode: saltipc.DecodeValue,
+	})
+
+	fake := saltipc.NewFake(start)
+
+	targets := make([]any, 0, minions)
+	for m := range minions {
+		targets = append(targets, fmt.Sprintf("web-%d", m))
+	}
+
+	for j := range jobs {
+		jid := fmt.Sprintf("2026083008%010d", j)
+
+		if err := fake.FeedData(h, "salt/job/"+jid+"/new", map[string]any{
+			"jid": jid, "fun": "state.apply", "tgt": "*", "minions": targets,
+		}); err != nil {
+			tb.Fatalf("feed job/new: %v", err)
+		}
+
+		for m := range minions {
+			minion := fmt.Sprintf("web-%d", m)
+			if err := fake.FeedData(h, "salt/job/"+jid+"/ret/"+minion, map[string]any{
+				"jid": jid, "id": minion, "retcode": 0, "success": true,
+			}); err != nil {
+				tb.Fatalf("feed job/ret: %v", err)
+			}
+		}
+	}
+
+	return h
+}
+
+// touchEveryJob re-delivers one already-seen return for each of the first n
+// jobs, which is what puts them back in the ingest layer's dirty set without
+// changing any job's size. It is the steady state of a busy master: between two
+// 100 ms ticks, every job on screen has moved.
+func touchEveryJob(tb testing.TB, h *hub, n int) {
+	tb.Helper()
+
+	fake := saltipc.NewFake(start)
+
+	for j := range n {
+		jid := fmt.Sprintf("2026083008%010d", j)
+		if err := fake.FeedData(h, "salt/job/"+jid+"/ret/web-0", map[string]any{
+			"jid": jid, "id": "web-0", "retcode": 0, "success": true,
+		}); err != nil {
+			tb.Fatalf("feed job/ret: %v", err)
+		}
+	}
+}
+
+// snapshotAllocBytes reports the bytes one Snapshot allocates with every job
+// freshly moved.
+//
+// Bytes rather than wall time on purpose: a timing assertion on a shared CI
+// runner is either flaky or so loose it cannot fail. What Snapshot allocates is
+// deterministic, and it is the direct proxy for the cost this is about — the
+// old path built two maps per job sized by that job's minion set, so its
+// allocation and its held-lock time scale together and by the same factor.
+//
+// touchEveryJob runs OUTSIDE the measured window, twice: once before the
+// warm-up snapshot that settles one-off allocations, and once after it, so the
+// snapshot being measured is one where every listed job has changed.
+func snapshotAllocBytes(tb testing.TB, h *hub, jobs int) uint64 {
+	tb.Helper()
+
+	touchEveryJob(tb, h, jobs)
+	h.Snapshot(filter.Query{}, 10)
+	touchEveryJob(tb, h, jobs)
+
+	var before, after runtime.MemStats
+
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+
+	h.Snapshot(filter.Query{}, 10)
+
+	runtime.ReadMemStats(&after)
+
+	return after.TotalAlloc - before.TotalAlloc
+}
+
+// TestTheSnapshotJobListDoesNotScaleWithMinionCount is invariant 6 on the job
+// path, which is where cache.Snapshot's already-fixed unbounded scan had its
+// twin.
+//
+// hub.jobList runs entirely under h.mu, so its cost IS the reader goroutine's
+// stall — measured at 22.55 ms at 200 jobs x 1000 minions against a 100 ms
+// tick. The list view renders counts (returned, expected, failed, a duration)
+// and never a minion NAME: the per-minion breakdown is the drill-down, which
+// goes through JobLookup and clones exactly one job on demand. So a tick must
+// not pay for the minion sets of two hundred jobs in order to draw thirty rows
+// of numbers.
+//
+// Both loads are run because they were different bugs. At 200 jobs the clone
+// cache is retained and every entry in it is stale, so all 200 are re-cloned.
+// At 300 the dirty set exceeds listJobs, the guard DISCARDS the cache, and all
+// 200 are re-cloned anyway — the optimisation degrading to full cost under
+// exactly the load it exists for.
+//
+// The assertion is on the SHAPE (flat in minion count), not on a byte budget,
+// so it fails on a return to O(job size) without failing on an extra row field.
+func TestTheSnapshotJobListDoesNotScaleWithMinionCount(t *testing.T) {
+	t.Parallel()
+
+	const (
+		lean = 10
+		fat  = 1000
+	)
+
+	loads := map[string]int{
+		"every listed job dirty": listJobs,
+		"more dirty than listed": listJobs + 100,
+	}
+
+	for name, jobs := range loads {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			small := snapshotAllocBytes(t, jobsHub(t, jobs, lean), jobs)
+			large := snapshotAllocBytes(t, jobsHub(t, jobs, fat), jobs)
+
+			if small == 0 {
+				t.Fatal("premise failed: a snapshot allocated nothing at all")
+			}
+
+			if large > 2*small {
+				t.Errorf("a snapshot of %d jobs allocates %d bytes at %d minions each "+
+					"but %d at %d — the tick is paying O(job size) rather than "+
+					"O(visible rows), and every byte of it is held ingest lock",
+					jobs, large, fat, small, lean)
+			}
+		})
+	}
+}
+
+// TestTheJobNewDecodeHappensOutsideTheIngestLock.
+//
+// factsFor is the ONE msgpack decode at ingest (invariant 4's recorded
+// deviation — spec §7.5's denominator has no other source), and it was run
+// while h.mu was held: 5.2 ms at 20,000 minions, on a tool that runs as root on
+// a production master. It touches no hub state but h.decode, which is set once
+// in newHub and never written.
+//
+// The observable is the LOCK, not the returned facts, so this asserts on the
+// lock directly: while a decode is in flight, another goroutine must be able to
+// take h.mu. Held, this test times out; hoisted, it returns at once.
+func TestTheJobNewDecodeHappensOutsideTheIngestLock(t *testing.T) {
+	t.Parallel()
+
+	var once sync.Once
+
+	decoding := make(chan struct{})
+	release := make(chan struct{})
+
+	h := newHub(hubConfig{
+		MaxMemory: 1 << 20, MaxJobs: 100, Clock: stats.NewFakeClock(start),
+		Decode: func(b []byte) (any, error) {
+			once.Do(func() { close(decoding) })
+			<-release
+
+			return saltipc.DecodeValue(b)
+		},
+	})
+
+	fed := make(chan struct{})
+
+	go func() {
+		defer close(fed)
+
+		fake := saltipc.NewFake(start)
+		if err := fake.FeedData(h, "salt/job/"+testJID+"/new", map[string]any{
+			"jid": testJID, "fun": "test.ping", "minions": []any{"web-1"},
+		}); err != nil {
+			t.Errorf("feed job/new: %v", err)
+		}
+	}()
+
+	<-decoding
+
+	took := make(chan struct{})
+
+	go func() {
+		h.Attached(true)
+		close(took)
+	}()
+
+	select {
+	case <-took:
+	case <-time.After(2 * time.Second):
+		t.Error("the ingest lock was held for the whole job/new decode: nothing " +
+			"else can touch the hub while a 20,000-minion payload is unpacked")
+	}
+
+	close(release)
+	<-fed
+	<-took
+}
+
+// benchJobListLoads is the ladder the final review measured hub.jobList on.
+var benchJobListLoads = []struct{ jobs, minions int }{
+	{10, 100}, {200, 100}, {200, 1000}, {300, 1000},
+}
+
+// BenchmarkHubSnapshotHoldsTheIngestLockForTheJobList measures the job half of
+// the tick's lock hold, the way BenchmarkHubSnapshotHoldsTheIngestLock measures
+// the cache half: Snapshot runs entirely under h.mu, so its wall time IS the
+// time the reader goroutine is blocked, ten times a second.
+//
+// Every listed job is put back in the dirty set before each timed iteration,
+// with the timer stopped, because a clean dirty set measures nothing — a busy
+// master never has one.
+func BenchmarkHubSnapshotHoldsTheIngestLockForTheJobList(b *testing.B) {
+	for _, load := range benchJobListLoads {
+		h := jobsHub(b, load.jobs, load.minions)
+
+		b.Run(fmt.Sprintf("%d-jobs/%d-minions", load.jobs, load.minions), func(b *testing.B) {
+			for range b.N {
+				b.StopTimer()
+				touchEveryJob(b, h, load.jobs)
+				b.StartTimer()
+
+				h.Snapshot(filter.Query{}, 2000)
+			}
+		})
+	}
+}
+
+// BenchmarkHubIngestLockHeldPerJobNew measures the OTHER thing on this lock,
+// and it cannot be measured by timing the call: after the decode is hoisted the
+// work still happens inside hub.Event, just not inside h.mu. So this times what
+// a competing goroutine — the render tick, in the real program — actually waits
+// for when it asks for the lock while job/new events are being ingested.
+//
+// 20,000 minions is the final review's figure for the payload that cost 5.2 ms
+// of held lock.
+func BenchmarkHubIngestLockHeldPerJobNew(b *testing.B) {
+	const minions = 20_000
+
+	h := newHub(hubConfig{
+		MaxMemory: 1 << 30, MaxJobs: 5000,
+		Clock: stats.NewFakeClock(start), Decode: saltipc.DecodeValue,
+	})
+
+	fake := saltipc.NewFake(start)
+
+	targets := make([]any, 0, minions)
+	for m := range minions {
+		targets = append(targets, fmt.Sprintf("web-%d", m))
+	}
+
+	var (
+		waited time.Duration
+		worst  time.Duration
+		takes  int64
+	)
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+
+			at := time.Now()
+			h.Attached(true)
+
+			since := time.Since(at)
+			waited += since
+			takes++
+
+			if since > worst {
+				worst = since
+			}
+
+			time.Sleep(50 * time.Microsecond)
+		}
+	}()
+
+	b.ResetTimer()
+
+	for i := range b.N {
+		jid := fmt.Sprintf("2026083008%010d", i)
+		if err := fake.FeedData(h, "salt/job/"+jid+"/new", map[string]any{
+			"jid": jid, "fun": "state.apply", "minions": targets,
+		}); err != nil {
+			b.Fatalf("feed job/new: %v", err)
+		}
+	}
+
+	b.StopTimer()
+	close(stop)
+	<-done
+
+	if takes > 0 {
+		b.ReportMetric(float64(waited.Nanoseconds())/float64(takes)/1e6, "ms/lock-wait")
+		b.ReportMetric(float64(worst.Nanoseconds())/1e6, "ms/worst-wait")
 	}
 }

@@ -33,3 +33,11 @@ func (c *FakeClock) Now() time.Time { return c.t }
 
 // Advance moves the fake clock forward.
 func (c *FakeClock) Advance(d time.Duration) { c.t = c.t.Add(d) }
+
+// Set moves the fake clock to t.
+//
+// Advance composes a time out of increments, which is exactly what a test of
+// PHASE cannot use: the offsets that expose a gap-vs-zero flicker are absolute
+// instants relative to a bucket boundary, not deltas from wherever the clock
+// happens to have arrived.
+func (c *FakeClock) Set(t time.Time) { c.t = t }

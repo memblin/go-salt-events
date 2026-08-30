@@ -13,6 +13,7 @@ import (
 	"github.com/TKC-Labs/go-salt-events/internal/config"
 	"github.com/TKC-Labs/go-salt-events/internal/model"
 	"github.com/TKC-Labs/go-salt-events/internal/salttag"
+	"github.com/TKC-Labs/go-salt-events/internal/stats"
 )
 
 // Sink receives everything the reader produces. The cache and the stats
@@ -78,11 +79,21 @@ const (
 //
 // A single report per retry is not enough at the far end of the backoff: the
 // rate rings expire buckets by wall clock, so buckets opened after the last
-// report are empty and unflagged, and at the 5s maximum backoff the newest
-// seconds bucket — the one the Rate pane prints as "now" — would read a flat
-// zero again for most of every wait. One report per bucket width keeps the head
-// of the ring truthful for the whole outage.
-const gapRefresh = time.Second
+// report would be empty, and at the 5s maximum backoff the newest seconds
+// bucket — the one the Rate pane prints as "now" — would read a flat zero again
+// for most of every wait.
+//
+// It is stats.GapReportInterval and not a number of its own. That is the point:
+// this used to be an independent time.Second which happened to equal the rate
+// ring's bucket width, and equal was never sufficient — two 1 Hz processes with
+// an arbitrary phase offset cannot cover each other, so on a live outage the
+// `now` callout flipped between "no data" and "0" about once a second. The
+// coupling is now a stated contract on the other side of the boundary (see
+// stats.GapValidity): the ring treats a report as describing the present for
+// GapValidity afterwards, on the promise that a reporter repeats it at least
+// every GapReportInterval. This is the reader keeping that promise, and there is
+// no second constant left to drift.
+const gapRefresh = stats.GapReportInterval
 
 // Reader owns the publish socket for the process lifetime.
 //

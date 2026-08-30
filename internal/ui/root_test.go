@@ -19,6 +19,7 @@ import (
 	"github.com/TKC-Labs/go-salt-events/internal/model"
 	"github.com/TKC-Labs/go-salt-events/internal/theme"
 	"github.com/TKC-Labs/go-salt-events/internal/ui"
+	"github.com/TKC-Labs/go-salt-events/internal/ui/components"
 )
 
 // TestMain pins the colour profile. Under `go test` stdout is not a terminal,
@@ -830,6 +831,74 @@ func TestADeadReaderTakesOverThePaneAndSaysWhy(t *testing.T) {
 	if !strings.Contains(after, "[Live]") {
 		t.Error("dismissing the diagnosis did not give the pane its body back")
 	}
+}
+
+// TestADeadReaderMarksEveryLineItTruncates.
+//
+// The banner is the one screen an operator reads when nothing else is working,
+// and a hard cut with no marker reads as a COMPLETE sentence: "…what is on
+// screen is what was collected b" is a message that appears to end there. Every
+// other surface in this tool marks its truncations through components.Clip;
+// this one is not allowed to be the exception, because it is the one that says
+// what to do next.
+//
+// Both halves are asserted: the fixed headline, which is longer than any
+// realistic pane width, and a wiring-supplied diagnosis line, which quotes a
+// resolved socket path and is therefore unbounded.
+func TestADeadReaderMarksEveryLineItTruncates(t *testing.T) {
+	t.Parallel()
+
+	const (
+		width = 60
+		long  = "cannot read /run/salt/master/very/deeply/nested/relocated/" +
+			"master_event_pub.ipc: permission denied and then some more text"
+	)
+
+	m := ready(t, newModel(t), width, 30)
+	m = step(t, m, ui.ReaderErrorMsg(long))
+
+	view := ansi.Strip(m.View())
+
+	for _, opening := range []string{"THE EVENT READER STOPPED", "cannot read /run/salt"} {
+		line := bannerLine(t, view, opening)
+
+		if !strings.HasSuffix(line, components.Ellipsis) {
+			t.Errorf("the reader banner cut a line with no %q marker, so it reads "+
+				"as a complete message:\n%q", components.Ellipsis, line)
+		}
+	}
+}
+
+// bannerCutWidth is the content width inside the frame's two border cells at
+// the width TestADeadReaderMarksEveryLineItTruncates renders at.
+const bannerCutWidth = 58
+
+// bannerLine returns the rendered banner row starting with opening, stripped of
+// the frame's border cells. It fails the test if the row is not truncated at
+// all, so the assertion above can never pass by never having lost any text.
+func bannerLine(t *testing.T, view, opening string) string {
+	t.Helper()
+
+	for _, line := range strings.Split(view, "\n") {
+		trimmed := strings.Trim(line, "│ ")
+		if !strings.HasPrefix(trimmed, opening) {
+			continue
+		}
+
+		// The source lines are both longer than the frame, so a row that runs
+		// to the box edge is a row that lost text. If it does not, the marker
+		// assertion below would pass without ever having been exercised.
+		if lipgloss.Width(trimmed) < bannerCutWidth {
+			t.Fatalf("premise failed: %q was not truncated at all, so the marker "+
+				"assertion proves nothing:\n%q", opening, trimmed)
+		}
+
+		return trimmed
+	}
+
+	t.Fatalf("the reader banner never rendered a line starting %q:\n%s", opening, view)
+
+	return ""
 }
 
 // TestTheHelpOverlayStillWinsOverADeadReader: `?` is an explicit request, and

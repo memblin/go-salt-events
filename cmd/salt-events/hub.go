@@ -72,11 +72,12 @@ type hubConfig struct {
 // # What escapes the lock
 //
 // Only values and freshly built slices. Every ranked entry, bucket window and
-// cache stat is copied on the way out. The two that are NOT naturally copies
-// are jobs — a *model.Job is mutated in place as returns arrive — so the
-// snapshot carries Clone()s (see jobList) and JobLookup clones under the lock.
-// Handing out the live pointer would let a pane read a job's map while the
-// reader goroutine writes it.
+// cache stat is copied on the way out. The one that is NOT naturally a copy is
+// a job — a *model.Job is mutated in place as returns arrive — so the snapshot
+// carries model.JobRows for the list (see jobList) and JobLookup Clone()s the
+// single drilled job under the lock. Handing out the live pointer would let a
+// pane read a job's map while the reader goroutine writes it, which is a
+// concurrent map access: a process-killing crash, not merely a race.
 type hub struct {
 	mu sync.Mutex
 
@@ -88,14 +89,6 @@ type hub struct {
 	minions *stats.Counter
 	funs    *stats.Counter
 	jobs    *stats.JobIndex
-
-	// jobCopies is the immutable clone handed to the last snapshot for each
-	// listed job, and jobDirty is the set of jobs that have changed since. A
-	// tick re-clones only what actually moved, so a 1,000-target job costs one
-	// copy when it is receiving returns and nothing at all when it is not —
-	// without which the snapshot would cost O(job index), not O(visible rows).
-	jobCopies map[string]*model.Job
-	jobDirty  map[string]struct{}
 
 	decode func([]byte) (any, error)
 
@@ -113,16 +106,14 @@ func newHub(cfg hubConfig) *hub {
 	}
 
 	return &hub{
-		clock:     clock,
-		cache:     cache.New(cfg.MaxMemory),
-		rings:     stats.NewRings(clock),
-		cats:      stats.NewCounter(maxTopKeys),
-		minions:   stats.NewCounter(maxTopKeys),
-		funs:      stats.NewCounter(maxTopKeys),
-		jobs:      stats.NewJobIndex(cfg.MaxJobs, cfg.MaxMemory/jobMemFraction, clock),
-		jobCopies: make(map[string]*model.Job),
-		jobDirty:  make(map[string]struct{}),
-		decode:    cfg.Decode,
+		clock:   clock,
+		cache:   cache.New(cfg.MaxMemory),
+		rings:   stats.NewRings(clock),
+		cats:    stats.NewCounter(maxTopKeys),
+		minions: stats.NewCounter(maxTopKeys),
+		funs:    stats.NewCounter(maxTopKeys),
+		jobs:    stats.NewJobIndex(cfg.MaxJobs, cfg.MaxMemory/jobMemFraction, clock),
+		decode:  cfg.Decode,
 	}
 }
 
@@ -132,6 +123,21 @@ func newHub(cfg hubConfig) *hub {
 // is O(1) in the size of the cache and the index — and it never blocks on the
 // UI, which only ever pulls.
 func (h *hub) Event(e model.Event) {
+	// The one msgpack decode at ingest runs BEFORE the lock is taken. It is the
+	// most expensive thing on this path by an order of magnitude — 5.2 ms for a
+	// 20,000-minion `minions` list — and it needs nothing the lock guards: it
+	// reads e, which the reader goroutine owns until this returns, and h.decode,
+	// which newHub sets once and nothing ever writes again. Decoding under the
+	// mutex made that whole cost a stall on the render tick on a tool that runs
+	// as root on a production master.
+	//
+	// Invariant 4 is unchanged by the move: factsFor still refuses everything
+	// but job/new, so no return payload is decoded here and the per-event cost
+	// of ingest is still the shallow ExtractFields pass. Hoisting must not turn
+	// into decoding MORE than before, and it does not — the same events are
+	// decoded, in the same place in the sequence, just not behind the lock.
+	facts := h.factsFor(e)
+
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
@@ -150,7 +156,7 @@ func (h *hub) Event(e model.Event) {
 		h.funs.Add(e.Fun)
 	}
 
-	h.observeJob(e)
+	h.observeJob(e, facts)
 
 	// The cache is LAST because it takes ownership of the payload and may shed
 	// it immediately to stay in budget. Everything above reads only the eagerly
@@ -160,13 +166,21 @@ func (h *hub) Event(e model.Event) {
 	h.cache.Add(e)
 }
 
-// observeJob folds an event into the job index and records that the job moved.
-func (h *hub) observeJob(e model.Event) {
+// observeJob folds an event into the job index.
+//
+// facts is decoded by the caller BEFORE h.mu is taken; see Event.
+//
+// It keeps no per-job bookkeeping of its own. It used to maintain a dirty set
+// and a cache of the clone last handed to a snapshot, so that a tick re-copied
+// only the jobs that had moved. That cache is gone with the clones it existed
+// to avoid: jobList now builds a model.JobRow per listed job in O(1), so there
+// is nothing left worth caching — and nothing left to leak while a PAUSED
+// console takes no snapshots (invariant 7), which is the failure mode the dirty
+// set had to be bounded against.
+func (h *hub) observeJob(e model.Event, facts newJobFacts) {
 	if e.Kind != model.KindNew && e.Kind != model.KindRet {
 		return
 	}
-
-	facts := h.factsFor(e)
 
 	h.jobs.Observe(e, facts.expected, facts.trimmed)
 
@@ -175,21 +189,6 @@ func (h *hub) observeJob(e model.Event) {
 	}
 
 	h.describeJob(e.JID, facts)
-
-	h.jobDirty[e.JID] = struct{}{}
-
-	// The dirty set is only a filter over what the next snapshot must re-copy,
-	// and nothing empties it but a snapshot. A PAUSED console takes no
-	// snapshots (invariant 7 — the view freezes, ingest does not), so on a busy
-	// master the set would otherwise grow for as long as the pause lasts. Past
-	// the size of the list itself the filter has stopped saving anything
-	// anyway: drop it, and drop the cache with it so the next snapshot re-clones
-	// from scratch rather than trusting stale copies.
-	if len(h.jobDirty) > listJobs {
-		clear(h.jobDirty)
-
-		h.jobCopies = nil
-	}
 }
 
 // describeJob records the descriptive fields a job/new event carries beyond the
@@ -245,6 +244,12 @@ type newJobFacts struct {
 // runs only on job/new events — a handful per session rather than per event —
 // so invariant 4's intent holds: the per-event cost of ingest is still the
 // shallow ExtractFields pass, and no return payload is ever decoded here.
+//
+// It must be called with h.mu NOT held, and it is safe there because it touches
+// no hub state that the lock guards: h.decode is written once by newHub and
+// read-only afterwards, and e belongs to the reader goroutine. Moving this call
+// back inside the lock would return a multi-millisecond stall to the render
+// tick; see Event.
 func (h *hub) factsFor(e model.Event) newJobFacts {
 	if e.Kind != model.KindNew || len(e.Payload) == 0 || h.decode == nil {
 		return newJobFacts{}
@@ -478,37 +483,34 @@ func (h *hub) Snapshot(q filter.Query, limit int) ui.Snapshot {
 	}
 }
 
-// jobList returns the listed jobs as clones that ingest cannot mutate.
+// jobList returns the listed jobs as rows that ingest cannot mutate.
 //
-// A job is re-cloned only when it has changed since the last snapshot. Without
-// that, a tick would deep-copy every listed job — up to listJobs × the minion
-// sets, which for a master running large highstates is hundreds of thousands of
-// map entries ten times a second, and would make the snapshot cost scale with
-// the job index rather than with the viewport (invariant 6).
+// This runs under h.mu on every render tick, so its cost IS the reader
+// goroutine's stall. It is O(listJobs) and nothing more: a model.JobRow is a
+// fixed set of value fields, and every count on it is either a map length or an
+// incrementally maintained counter, so the size of a job's minion sets does not
+// enter into it.
+//
+// It used to hand out job.Clone()s, deep-copying both minion maps of every job
+// that had moved since the last tick — 22.55 ms of held lock at 200 listed jobs
+// x 1,000 minions against a 100 ms render interval, i.e. ~22% of wall clock
+// blocked for as long as that load persisted. That is the same magnitude and
+// the same shape as cache.Snapshot's unbounded scan, which was bounded for the
+// same reason. A clone cache filtered by a dirty set took the ordinary case off
+// that path but not the busy one — under sustained load every listed job is
+// dirty every tick, so the cache saved nothing at exactly the load it was
+// written for, and past listJobs dirty entries it was DISCARDED, re-cloning the
+// whole list. Bounding by what the viewport needs rather than by what changed
+// removes the cost instead of deferring it.
 //
 // Caller must hold h.mu.
-func (h *hub) jobList() []*model.Job {
+func (h *hub) jobList() []model.JobRow {
 	live := h.jobs.List(listJobs)
 
-	out := make([]*model.Job, 0, len(live))
-	next := make(map[string]*model.Job, len(live))
-
+	out := make([]model.JobRow, 0, len(live))
 	for _, job := range live {
-		clone, cached := h.jobCopies[job.JID]
-
-		if _, changed := h.jobDirty[job.JID]; changed || !cached {
-			clone = job.Clone()
-		}
-
-		next[job.JID] = clone
-		out = append(out, clone)
+		out = append(out, job.Row())
 	}
-
-	// Rebuilding rather than deleting bounds the cache at the list size: a job
-	// that has aged out of the list must not keep its clone alive forever.
-	h.jobCopies = next
-
-	clear(h.jobDirty)
 
 	return out
 }

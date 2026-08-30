@@ -144,17 +144,25 @@ func (m Model) helpView(w, h int) string {
 // The text comes from the wiring layer, not from the bus, but it is sanitised
 // like everything else: it quotes a resolved socket path, and this tool runs
 // as root.
+//
+// Every line goes through components.Clip rather than Sanitise+Fit, which is
+// the same sanitising plus the one thing Fit does not do: it MARKS what it cut.
+// An unmarked cut here is worse than anywhere else in the tool — this is the
+// screen an operator reads when nothing is working, and a hard truncation reads
+// as a sentence that genuinely ended, so a headline cut mid-clause looks like
+// the whole diagnosis. Both the fixed headline and the wiring-supplied lines
+// (which quote an unbounded resolved path) can overrun a narrow frame.
 func (m Model) readerErrView(w, h int) string {
 	lines := []string{
-		m.styles.Err.Render(components.Fit(components.Sanitise(readerStoppedHeadline), w)),
+		m.styles.Err.Render(components.Clip(readerStoppedHeadline, w)),
 		"",
 	}
 
 	for _, raw := range strings.Split(strings.TrimRight(m.readerErr, "\n"), "\n") {
-		lines = append(lines, m.styles.Value.Render(components.Fit(components.Sanitise(raw), w)))
+		lines = append(lines, m.styles.Value.Render(components.Clip(raw, w)))
 	}
 
-	lines = append(lines, "", m.styles.Muted.Render(components.Fit(readerErrDismiss, w)))
+	lines = append(lines, "", m.styles.Muted.Render(components.Clip(readerErrDismiss, w)))
 
 	if len(lines) > h {
 		lines = lines[:h]

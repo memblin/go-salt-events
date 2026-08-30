@@ -73,7 +73,15 @@ type Snapshot struct {
 	TopMinions    []stats.Entry
 	TopFunctions  []stats.Entry
 
-	Jobs     []*model.Job
+	// Jobs is the job LIST, as rows rather than as jobs.
+	//
+	// A row carries no minion sets, which is what keeps a tick's cost O(visible
+	// rows) rather than O(the index): the list renders returned/expected, a
+	// failure count and a duration, and never a minion name. The per-minion
+	// breakdown is JobLookup's job, and it clones exactly one job on demand.
+	// Handing whole jobs here cost 22.55 ms of held ingest lock per tick at 200
+	// jobs x 1,000 minions (invariant 6).
+	Jobs     []model.JobRow
 	JobStats stats.IndexStats
 
 	// JobLookup resolves a JID against the job index. It is a function rather

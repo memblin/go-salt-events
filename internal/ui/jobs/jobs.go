@@ -277,7 +277,7 @@ func (p *Pane) viewList(w, h int, s ui.Snapshot, st *theme.Styles) string {
 			j.Tgt,
 			retLabel(j),
 			duration(j, s.Now),
-			strconv.Itoa(j.Failed()),
+			strconv.Itoa(j.Failed),
 			"",
 		})
 	}
@@ -310,9 +310,9 @@ func indexHeader(is stats.IndexStats, st *theme.Styles) string {
 // max_event_size on the master; "unseen" by attaching sooner or raising
 // --max-jobs. Collapsing them sends the operator after the wrong thing, and
 // printing either as a number would fabricate a denominator (invariant 10).
-func retLabel(j *model.Job) string {
+func retLabel(j model.JobRow) string {
 	n, state := j.ExpectedCount()
-	returned := strconv.Itoa(j.Returned())
+	returned := strconv.Itoa(j.Returned)
 
 	switch state {
 	case model.ExpectedKnown:
@@ -328,12 +328,12 @@ func retLabel(j *model.Job) string {
 
 // expectedNote spells out what the ret column's glyph means, for the
 // drill-down title where there is room for words.
-func expectedNote(j *model.Job) string {
+func expectedNote(j model.JobRow) string {
 	_, state := j.ExpectedCount()
 
 	switch state {
 	case model.ExpectedKnown:
-		if j.Complete() {
+		if j.Complete {
 			return "complete"
 		}
 
@@ -361,14 +361,14 @@ func expectedNote(j *model.Job) string {
 //
 // It counts up only while the job is INCOMPLETE. A finished job's duration is
 // a fact about the job, not about how long the operator has been looking at it.
-func duration(j *model.Job, now time.Time) string {
+func duration(j model.JobRow, now time.Time) string {
 	if j.Start.IsZero() {
 		return "—"
 	}
 
 	end := j.LastRet
 
-	if !j.Complete() && !now.IsZero() && now.After(end) {
+	if !j.Complete && !now.IsZero() && now.After(end) {
 		end = now
 	}
 
@@ -426,9 +426,14 @@ func (p *Pane) viewDrilled(w, h int, s ui.Snapshot, st *theme.Styles) string {
 // drillLines assembles the drill-down, chrome first and then the visible slice
 // of the row window.
 func (p *Pane) drillLines(w, h int, job *model.Job, now time.Time, st *theme.Styles) []string {
+	// The drill-down holds a full job — JobLookup cloned exactly this one on
+	// demand — and reduces it to a row only for the header line, which renders
+	// the same three facts the list does and must render them identically.
+	row := job.Row()
+
 	lines := []string{
-		st.Header.Render(fit(truncJID(job.JID)+"  "+job.Fun+"  "+job.Tgt+"  "+
-			duration(job, now)+"  "+expectedNote(job), w)),
+		st.Header.Render(fit(truncJID(row.JID)+"  "+row.Fun+"  "+row.Tgt+"  "+
+			duration(row, now)+"  "+expectedNote(row), w)),
 		"",
 		counts(job, st),
 		st.Muted.Render(strings.Repeat("─", max(0, w))),
@@ -504,7 +509,7 @@ func (p *Pane) rows(job *model.Job, now time.Time) []row {
 	var missingRows []row
 
 	if missing, known := job.Missing(); known {
-		note := "no return after " + duration(job, now)
+		note := "no return after " + duration(job.Row(), now)
 		for _, m := range missing {
 			missingRows = append(missingRows, row{minion: m, state: stateMissing, note: note})
 		}

@@ -76,7 +76,7 @@ func bigJob(state model.ExpectedState) *model.Job {
 
 func snapWith(j *model.Job) ui.Snapshot {
 	return ui.Snapshot{
-		Jobs:     []*model.Job{j},
+		Jobs:     []model.JobRow{j.Row()},
 		JobStats: stats.IndexStats{Tracked: 1, Cap: 500},
 		JobLookup: func(string) (*model.Job, stats.Lookup) {
 			return j, stats.LookupFound

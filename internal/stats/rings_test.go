@@ -243,3 +243,176 @@ func TestRingsSurvivesAClockJumpFarBeyondTheRing(t *testing.T) {
 // secondBucketsGapSpan spans the whole 120-bucket second window so a MarkGap
 // call over it gaps every bucket, none left over from before the window.
 const secondBucketsGapSpan = stats.SecondBuckets * time.Second
+
+// TestGapReportingConstantsCannotDriftApart pins the RELATIONSHIP, not the
+// values.
+//
+// This is the fourth recurrence of gap-vs-zero in this project, and the reason
+// it keeps coming back is that the coupling between how often a gap is reported
+// and how the rings age has never been anything but reasoning in a comment. The
+// values were equal — gapRefresh 1 s against a 1 s bucket — and equal was never
+// sufficient: two 1 Hz processes with an arbitrary phase offset cannot cover
+// each other, so the head bucket read a genuine `0` for part of every second of
+// a live outage.
+//
+// Three orderings have to hold, and each fails a different way:
+//
+//   - GapReportInterval well inside GapValidity, so a report that arrives a
+//     little late — the reader dials between waits, and a dial is not free —
+//     still lands while the previous one is authoritative. Equal periods leave
+//     no slack at all, which is exactly the mistake this replaces.
+//   - GapValidity strictly less than BucketWidth, so when reports STOP (the
+//     master came back and the bus is merely quiet) the ring returns to honest
+//     zeros inside one bucket. Extrapolating a gap for longer than a bucket
+//     would invert the error and render a quiet master as an outage.
+//   - Both positive, because a zero interval is a busy loop and a zero validity
+//     silently restores the original bug.
+func TestGapReportingConstantsCannotDriftApart(t *testing.T) {
+	t.Parallel()
+
+	if stats.GapReportInterval <= 0 || stats.GapValidity <= 0 {
+		t.Fatalf("GapReportInterval = %v, GapValidity = %v; both must be positive",
+			stats.GapReportInterval, stats.GapValidity)
+	}
+
+	if 2*stats.GapReportInterval > stats.GapValidity {
+		t.Errorf("GapReportInterval = %v against GapValidity = %v: a reporter that "+
+			"runs a little late leaves the head bucket reading a genuine 0 during "+
+			"an outage, which is the §8.2 inversion this pairing exists to prevent",
+			stats.GapReportInterval, stats.GapValidity)
+	}
+
+	if stats.GapValidity >= stats.BucketWidth {
+		t.Errorf("GapValidity = %v against BucketWidth = %v: a gap report stays "+
+			"authoritative for a whole bucket or more, so a master that came back "+
+			"and went quiet renders as an outage",
+			stats.GapValidity, stats.BucketWidth)
+	}
+}
+
+// TestBucketWidthIsTheWidthTheRingActuallyUses stops BucketWidth from being a
+// decorative constant. The ring indexes by Unix SECOND arithmetic, not by this
+// value, so nothing else would notice the two disagreeing — and the constant
+// above is only meaningful if it is the real bucket width.
+func TestBucketWidthIsTheWidthTheRingActuallyUses(t *testing.T) {
+	t.Parallel()
+
+	at := time.Date(2026, 8, 30, 8, 14, 2, 0, time.UTC)
+
+	r := stats.NewRings(stats.NewFakeClock(at))
+	r.Add(at)
+	r.Add(at.Add(stats.BucketWidth))
+
+	bs := r.Seconds()
+
+	if n := len(bs); n < 2 {
+		t.Fatalf("Seconds() returned %d buckets", n)
+	}
+
+	newest, before := bs[len(bs)-1], bs[len(bs)-2]
+
+	if newest.Count != 1 || before.Count != 1 {
+		t.Errorf("two events one BucketWidth (%v) apart landed as %d and %d: "+
+			"BucketWidth does not describe the ring's real bucket",
+			stats.BucketWidth, before.Count, newest.Count)
+	}
+}
+
+// TestAnOutageNeverRendersAsAZeroAcrossBucketRollovers is the regression this
+// whole pairing exists for, driven the way the real program drives it: a
+// reporter calling MarkGap on its own period, a renderer calling Seconds() on
+// the render tick, and a PHASE OFFSET between them and the bucket boundary.
+//
+// Task 7's test sampled immediately after a MarkGap call — phase zero, the one
+// instant the bug cannot be observed — which is why three reviews passed over
+// it. Here the offsets are deliberately awkward and the run crosses several
+// bucket rollovers, because the failure IS the rollover: advance() opened each
+// new head bucket as Bucket{}, a genuine Count 0 with Gap false, and
+// Summary.NowIsGap reads exactly that flag. On a live outage the Rate pane's
+// `now` callout flipped between "no data" and "0" eleven times.
+func TestAnOutageNeverRendersAsAZeroAcrossBucketRollovers(t *testing.T) {
+	t.Parallel()
+
+	// renderInterval mirrors config.RenderInterval. internal/stats must not
+	// import internal/config (it is the layer below), so it is restated.
+	const renderInterval = 100 * time.Millisecond
+
+	// Offsets chosen so neither the reporter nor the renderer is aligned with a
+	// bucket boundary or with each other.
+	for _, offset := range []time.Duration{
+		0, 37 * time.Millisecond, 249 * time.Millisecond, 501 * time.Millisecond,
+		870 * time.Millisecond, 999 * time.Millisecond,
+	} {
+		t.Run(offset.String(), func(t *testing.T) {
+			t.Parallel()
+
+			base := time.Date(2026, 8, 30, 8, 14, 2, 0, time.UTC)
+			lostAt := base.Add(offset)
+
+			clk := stats.NewFakeClock(lostAt)
+			r := stats.NewRings(clk)
+
+			// A live bus, several buckets before the outage, so the buckets the
+			// outage runs through are genuinely empty. A bucket that saw a real
+			// event is never a gap and must not be — markGapRing refuses to
+			// overwrite a count, which is correct.
+			r.Add(lostAt.Add(-5 * time.Second))
+
+			// The reader's very first report of the outage.
+			r.MarkGap(lostAt, lostAt)
+
+			var (
+				lastReport = lostAt
+				elapsed    time.Duration
+			)
+
+			// Five seconds of outage: five bucket rollovers, forty render ticks.
+			for elapsed = renderInterval; elapsed <= 5*time.Second; elapsed += renderInterval {
+				now := lostAt.Add(elapsed)
+
+				// The reporter runs on its own period, not on the render tick.
+				for !now.Before(lastReport.Add(stats.GapReportInterval)) {
+					lastReport = lastReport.Add(stats.GapReportInterval)
+					clk.Set(lastReport)
+					r.MarkGap(lostAt, lastReport)
+				}
+
+				clk.Set(now)
+
+				sum := r.SummarySeconds()
+				if !sum.NowIsGap {
+					t.Fatalf("at +%v (offset %v) the head bucket reads a genuine 0: "+
+						"the Rate pane prints `now 0` and the operator reads a quiet "+
+						"master where the bus is gone (spec §8.2)", elapsed, offset)
+				}
+			}
+		})
+	}
+}
+
+// TestTheRingReturnsToHonestZerosWhenTheGapReportsStop is the other half, and
+// it is why GapValidity is bounded rather than open-ended.
+//
+// A gap report is extrapolated forwards precisely because the reporter promises
+// to repeat it. When the master comes back the reports stop, and the ring must
+// stop claiming an outage — otherwise a reconnected but QUIET master renders as
+// a lost bus, which is spec §8.2's inversion pointed the other way, and the
+// reader's own history: connection state used to be inferred from event arrival
+// and a healthy quiet master read DISCONNECTED in capitals.
+func TestTheRingReturnsToHonestZerosWhenTheGapReportsStop(t *testing.T) {
+	t.Parallel()
+
+	lostAt := time.Date(2026, 8, 30, 8, 14, 2, 0, time.UTC)
+	clk := stats.NewFakeClock(lostAt)
+	r := stats.NewRings(clk)
+
+	r.MarkGap(lostAt, lostAt)
+
+	// One bucket after the last report, nothing may still be extrapolated.
+	clk.Set(lostAt.Add(2 * stats.BucketWidth))
+
+	if r.SummarySeconds().NowIsGap {
+		t.Error("the head bucket still reads as a gap two buckets after the last " +
+			"report; a quiet master that has come back renders as a lost bus")
+	}
+}

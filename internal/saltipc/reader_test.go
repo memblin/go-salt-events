@@ -805,6 +805,13 @@ type ringSink struct {
 	// about the outage that follows it.
 	gapAfter time.Time
 
+	// gapAt is the WALL-CLOCK instant of every report. The logical clock cannot
+	// answer this: the reader's refresh rate is a property of its real sleeps,
+	// and what it has to be fast enough for is stats.GapValidity, which is also
+	// real time. It pins the REFRESH RATE rather than merely the fact that a
+	// report happens at all.
+	gapAt []time.Time
+
 	gappedOnce sync.Once
 	gapped     chan struct{}
 
@@ -832,11 +839,20 @@ func (s *ringSink) Event(e model.Event) {
 func (s *ringSink) Gap(from, to time.Time) {
 	s.mu.Lock()
 	s.rings.MarkGap(from, to)
+	s.gapAt = append(s.gapAt, time.Now())
 	s.mu.Unlock()
 
 	if !to.Before(s.gapAfter) {
 		s.gappedOnce.Do(func() { close(s.gapped) })
 	}
+}
+
+// gapTimes is a copy of every report instant so far.
+func (s *ringSink) gapTimes() []time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return append([]time.Time(nil), s.gapAt...)
 }
 
 func (s *ringSink) DecodeError(error) {}
@@ -1117,5 +1133,117 @@ func TestFakeFeedDataRunsTheRealExtractPath(t *testing.T) {
 
 	if len(e.Payload) == 0 {
 		t.Error("Payload is empty; FeedData must produce real msgpack")
+	}
+}
+
+// TestTheReaderRepeatsAGapOftenEnoughForTheRings is the reader's half of the
+// contract stats.GapValidity states.
+//
+// stats.Rings extrapolates a reported gap forward for GapValidity, which is
+// what stops a bucket rolling over mid-outage from opening as a genuine zero —
+// but only on the promise that a reporter repeats itself at least every
+// GapReportInterval. Nothing in the type system enforces that: gapRefresh could
+// be multiplied by four tomorrow and every unit test on either side would still
+// pass while the `now` callout went back to flickering between "no data" and
+// "0" on a live master.
+//
+// So this measures the SPACING of the reports a running reader really delivers,
+// and it measures it late enough in the outage to be measuring the right thing.
+// Early on, the retry backoff is shorter than the refresh period and every
+// round emits a report of its own, which hides the refresh rate entirely; only
+// once the backoff has grown past it does gapRefresh become what governs the
+// spacing. Hence the settle: by then the reader is in the 1s and 2s rounds on
+// its way to the 5s ceiling.
+//
+// The bound is loose relative to GapReportInterval and tight relative to
+// GapValidity, because that is the property that matters — a report is allowed
+// to be late, but not so late that the ring stops covering the rollover.
+func TestTheReaderRepeatsAGapOftenEnoughForTheRings(t *testing.T) {
+	t.Parallel()
+
+	// settle waits out the short backoff rounds; observe is the window the
+	// spacing is measured over.
+	const (
+		settle  = 1200 * time.Millisecond
+		observe = 2500 * time.Millisecond
+	)
+
+	srv := newBusServer(t, pubSocket)
+	srv.serve(frame(t, "salt/auth", map[string]any{"act": "accept"}), 1, 0)
+
+	start := time.Date(2026, 8, 30, 8, 14, 0, 0, time.UTC)
+	clk := &testClock{t: start}
+	sink := newRingSink(stats.NewRings(clk), start)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+
+	go func() { done <- saltipc.NewReader(srv.dir, clk.Now).Run(ctx, sink) }()
+
+	// The master is gone for good once serve has accepted its one connection:
+	// the listener closes, which unlinks the socket, so every dial from here on
+	// fails and the reader is permanently in waitToRetry.
+	select {
+	case <-sink.gapped:
+	case err := <-done:
+		t.Fatalf("Run returned %v without reporting the outage in progress", err)
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for the first gap report")
+	}
+
+	time.Sleep(settle)
+
+	from := time.Now()
+
+	time.Sleep(observe)
+
+	until := time.Now()
+
+	cancel()
+	<-done
+
+	// The spacing to measure includes the run up to the window's start and down
+	// to its end: a reader silent for the whole window would otherwise show no
+	// spacing at all and pass.
+	var (
+		worst time.Duration
+		prev  = from
+		seen  int
+	)
+
+	for _, at := range sink.gapTimes() {
+		if at.Before(from) {
+			prev = at
+
+			continue
+		}
+
+		if at.After(until) {
+			break
+		}
+
+		if d := at.Sub(prev); d > worst {
+			worst = d
+		}
+
+		prev, seen = at, seen+1
+	}
+
+	if d := until.Sub(prev); d > worst {
+		worst = d
+	}
+
+	if seen == 0 {
+		t.Fatalf("premise failed: no gap reports at all in %v of outage", observe)
+	}
+
+	if limit := 2 * stats.GapReportInterval; worst > limit {
+		t.Errorf("the reader left %v between two gap reports (%d reports in %v), "+
+			"want at most %v: stats.Rings keeps the head bucket honest for only %v "+
+			"after a report, so a bucket rolling over in that silence opens as a "+
+			"genuine 0 and the Rate pane prints a quiet master (spec §8.2)",
+			worst, seen, observe, limit, stats.GapValidity)
 	}
 }

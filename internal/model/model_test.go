@@ -1,6 +1,7 @@
 package model_test
 
 import (
+	"strconv"
 	"testing"
 	"time"
 
@@ -153,5 +154,139 @@ func TestJobCloneSharesNothingWithTheOriginal(t *testing.T) {
 
 	if got := clone.Failed(); got != 0 {
 		t.Errorf("clone Failed() = %d after the original gained a failure, want 0", got)
+	}
+}
+
+// TestJobCountersMatchTheMapsUnderAnAdversarialSequence is the guard on the
+// incremental counters behind Failed, Complete and Row.
+//
+// Failed and Complete used to walk the two maps on every call, which is
+// self-evidently consistent and was also the cost that made a snapshot hold the
+// ingest lock for 22 ms. They are now maintained as events arrive, and the
+// price of that is that they can DRIFT — silently, and in the direction that
+// matters, since Complete decides whether a job stops counting its duration up
+// and whether the index may evict it.
+//
+// So the counters are re-derived from the maps after every single step of a
+// deliberately hostile sequence: returns before their job/new, duplicate
+// targets, a repeat return that flips a failure into a success and back, and a
+// return for a minion that was never targeted.
+func TestJobCountersMatchTheMapsUnderAnAdversarialSequence(t *testing.T) {
+	t.Parallel()
+
+	type step struct {
+		name string
+		do   func(*model.Job)
+	}
+
+	ret := func(minion string, code int) step {
+		return step{
+			name: minion + " returns " + strconv.Itoa(code),
+			do: func(j *model.Job) {
+				j.AddReturn(model.RetInfo{
+					Minion: minion, RetCode: code, Success: code == 0,
+					Arrival: time.Unix(1_800_000_000, 0),
+				})
+			},
+		}
+	}
+
+	exp := func(minion string) step {
+		return step{
+			name: "target " + minion,
+			do:   func(j *model.Job) { j.AddExpected(minion) },
+		}
+	}
+
+	steps := []step{
+		ret("web-1", 0), // a return arriving before the job/new
+		exp("web-1"),    // ... whose target is only learned afterwards
+		exp("web-2"),    //
+		exp("web-2"),    // duplicate target: must not double-count missing
+		ret("web-2", 1), // a failure
+		ret("web-2", 0), // the same minion returns again, now succeeding
+		ret("web-2", 2), // and again, failing
+		ret("web-3", 1), // a return from a minion that was never targeted
+		exp("web-4"),    // still missing at the end
+		ret("web-1", 3), // a repeat return that turns a success into a failure
+	}
+
+	job := model.NewJob("20260830081402123456")
+	job.ExpectedState = model.ExpectedKnown
+
+	for _, s := range steps {
+		s.do(job)
+
+		wantFailed := 0
+		for _, r := range job.Returns() {
+			if r.RetCode != 0 || !r.Success {
+				wantFailed++
+			}
+		}
+
+		if got := job.Failed(); got != wantFailed {
+			t.Fatalf("after %q: Failed() = %d, want %d (recomputed from Returns())",
+				s.name, got, wantFailed)
+		}
+
+		missing, known := job.Missing()
+		if !known {
+			t.Fatalf("after %q: Missing() reported the expected set unknown", s.name)
+		}
+
+		if got, want := job.Complete(), len(missing) == 0; got != want {
+			t.Fatalf("after %q: Complete() = %v, want %v (%d still missing: %v)",
+				s.name, got, want, len(missing), missing)
+		}
+
+		row := job.Row()
+
+		if row.Failed != wantFailed || row.Returned != job.Returned() ||
+			row.Complete != job.Complete() {
+			t.Fatalf("after %q: Row() = %+v, disagrees with the job it came from "+
+				"(failed %d, returned %d, complete %v)",
+				s.name, row, wantFailed, job.Returned(), job.Complete())
+		}
+
+		n, state := row.ExpectedCount()
+		jn, jstate := job.ExpectedCount()
+
+		if n != jn || state != jstate {
+			t.Fatalf("after %q: Row().ExpectedCount() = (%d, %v), want (%d, %v)",
+				s.name, n, state, jn, jstate)
+		}
+	}
+}
+
+// TestJobRowRefusesAnUnknownDenominator is invariant 10 at the new type. A row
+// is what the list renders from, so if it answered with a bare 0 the pane would
+// print "3/0" — a job that over-returned — for every job whose job/new was
+// never seen.
+func TestJobRowRefusesAnUnknownDenominator(t *testing.T) {
+	t.Parallel()
+
+	job := model.NewJob("20260830081402123456")
+	job.AddReturn(model.RetInfo{Minion: "web-1", Success: true})
+
+	n, state := job.Row().ExpectedCount()
+
+	if state != model.ExpectedUnseen {
+		t.Errorf("Row().ExpectedCount() state = %v, want ExpectedUnseen", state)
+	}
+
+	if n != 0 {
+		t.Errorf("Row().ExpectedCount() = %d for a job with no job/new, want 0 "+
+			"alongside the state the caller must branch on", n)
+	}
+
+	if job.Row().Complete {
+		t.Error("Row().Complete is true for a job whose expected set is unknown; " +
+			"an unknown denominator can never prove completeness")
+	}
+
+	// The zero JobRow is what a test or a pane gets before the first tick. It
+	// must read as "unknown", never as "targeted nobody".
+	if _, zeroState := (model.JobRow{}).ExpectedCount(); zeroState != model.ExpectedUnseen {
+		t.Errorf("the zero JobRow reports state %v, want ExpectedUnseen", zeroState)
 	}
 }

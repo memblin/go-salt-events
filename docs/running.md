@@ -425,8 +425,27 @@ While it is disconnected:
   incident.
 
 The gap is reported continuously while the outage runs, not retroactively on
-reconnect, so the `now` reading at the head of the graph is honest the whole
-time.
+reconnect, and the head of the graph stays honest across the second boundaries
+the outage crosses.
+
+That second part needs saying because it was wrong until recently, and the way
+it is wrong is instructive. The rate ring opens a new one-second bucket as the
+clock passes into it, ten times a second, whether or not anything is arriving —
+and a bucket with a count of zero and no gap flag *is* a genuine zero. The
+reader re-reported the outage once a second, which sounds sufficient and is not:
+two things happening once a second with an arbitrary offset between them cannot
+cover each other, so for part of every second the `now` callout read **`0`**
+rather than **`no data`**, flipping between the two for the length of the
+outage. During an incident those are opposite facts.
+
+It is now a stated contract in both directions rather than two numbers that
+happened to match: a gap report describes the present for a defined window
+afterwards (`stats.GapValidity`, half a bucket), and the reader promises to
+repeat itself more often than that (`stats.GapReportInterval`, a quarter of a
+bucket). A bucket that opens inside the window opens as a gap. When the reports
+stop — the master is back — the window lapses inside one bucket, so a
+reconnected but quiet master goes back to reading as quiet rather than as an
+outage.
 
 Events fired while you were disconnected are gone — the bus has no replay. The
 gap markers are how you know a flat stretch is missing data rather than quiet.
