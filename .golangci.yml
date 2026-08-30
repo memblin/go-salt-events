@@ -54,15 +54,20 @@ linters:
             - pkg: github.com/vmihailenco/msgpack/v5
               desc: "the UI must never decode wire format (spec §3.1)"
 
+        # Deny-by-default, then carve out the three places a TUI import is
+        # legitimate. The earlier form enumerated the seven ingest packages by
+        # path, which is fail-OPEN: internal/export was added later, matched no
+        # pattern, and silently escaped the layer rule entirely — it complied by
+        # luck, not by enforcement, and every future non-UI package would have
+        # inherited the same hole. This project enforces structurally rather
+        # than by convention, and a rule that looks complete but is not is worse
+        # than one honestly labelled.
         ingest-must-not-import-tui:
           files:
-            - "**/internal/saltipc/**"
-            - "**/internal/salttag/**"
-            - "**/internal/cache/**"
-            - "**/internal/filter/**"
-            - "**/internal/stats/**"
-            - "**/internal/config/**"
-            - "**/internal/model/**"
+            - "$all"
+            - "!**/internal/ui/**"
+            - "!**/internal/theme/**"
+            - "!**/cmd/**"
           deny:
             - pkg: github.com/charmbracelet/bubbletea
               desc: "the ingest layer must not import bubbletea (spec §3.1)"
