@@ -1,8 +1,10 @@
 package ui_test
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +15,7 @@ import (
 	"github.com/muesli/termenv"
 
 	"github.com/TKC-Labs/go-salt-events/internal/filter"
+	"github.com/TKC-Labs/go-salt-events/internal/model"
 	"github.com/TKC-Labs/go-salt-events/internal/theme"
 	"github.com/TKC-Labs/go-salt-events/internal/ui"
 )
@@ -451,4 +454,313 @@ func TestSwitchingPanesSwitchesTheHints(t *testing.T) {
 	if row := hintRow(t, keys(t, m, "1").View()); strings.Contains(row, "F fit") {
 		t.Errorf("focusing a keyless pane left Rate's key on screen: hint row %q", row)
 	}
+}
+
+// pinningPane reports a pinned JID, the way the Jobs pane does while drilled in.
+type pinningPane struct {
+	stubPane
+
+	jid string
+}
+
+func (p *pinningPane) PinnedJID() string { return p.jid }
+
+// viewerPane records what the root asked it to display, the way Detail does.
+type viewerPane struct {
+	stubPane
+
+	got model.Event
+}
+
+func (p *viewerPane) SetEvent(e model.Event) { p.got = e }
+
+// pinningSource records the pins the root pushed at it.
+type pinningSource struct {
+	stubSource
+
+	pins []string
+}
+
+func (s *pinningSource) PinJob(jid string) { s.pins = append(s.pins, jid) }
+
+// TestTheRootPinsWhateverAPaneIsHolding is the carry-forward the Jobs pane
+// could not do itself: it exposes PinnedJID, and without this call the pinned
+// job scrolls and evicts exactly as if it were never pinned — pinning that
+// looks like it works.
+func TestTheRootPinsWhateverAPaneIsHolding(t *testing.T) {
+	t.Parallel()
+
+	holder := &pinningPane{stubPane: stubPane{title: "Jobs"}}
+	src := &pinningSource{}
+
+	m := ui.NewModel(src, []ui.Pane{&stubPane{title: "Live"}, holder}, ui.Options{
+		Theme: "gruvbox-dark", Interval: time.Hour,
+	})
+	m = ready(t, m, 100, 30)
+
+	m = step(t, m, ui.TickMsg(time.Now()))
+
+	holder.jid = "20260830081402123456"
+	m = step(t, m, ui.TickMsg(time.Now()))
+
+	holder.jid = ""
+	_ = step(t, m, ui.TickMsg(time.Now()))
+
+	want := []string{"", "20260830081402123456", ""}
+	if !slices.Equal(src.pins, want) {
+		t.Errorf("pins pushed = %v, want %v", src.pins, want)
+	}
+}
+
+// TestPinningSurvivesAPause: the pin is what stops the job the operator is
+// READING from being evicted, and pausing is exactly when they are reading it.
+func TestPinningSurvivesAPause(t *testing.T) {
+	t.Parallel()
+
+	holder := &pinningPane{stubPane: stubPane{title: "Jobs"}, jid: "20260830081402123456"}
+	src := &pinningSource{}
+
+	m := ui.NewModel(src, []ui.Pane{holder}, ui.Options{Theme: "gruvbox-dark", Interval: time.Hour})
+	m = ready(t, m, 100, 30)
+	m = keys(t, m, " ") // pause
+	_ = step(t, m, ui.TickMsg(time.Now()))
+
+	if len(src.pins) == 0 || src.pins[len(src.pins)-1] != "20260830081402123456" {
+		t.Errorf("pins pushed while paused = %v, want the held job", src.pins)
+	}
+}
+
+// TestAPaneCommandReachesTheRoot is the routing fix itself. Model.Update's
+// default arm forwards to the FOCUSED pane, so before the root grew a case for
+// it, a message a pane emitted came straight back to that pane and the
+// drill-through of spec §7.2 could not be bound at all.
+func TestAPaneCommandReachesTheRoot(t *testing.T) {
+	t.Parallel()
+
+	viewer := &viewerPane{stubPane: stubPane{title: "Detail"}}
+
+	m := ui.NewModel(stubSource{}, []ui.Pane{&stubPane{title: "Live"}, viewer}, ui.Options{
+		Theme: "gruvbox-dark", Interval: time.Hour,
+	})
+	m = ready(t, m, 100, 30)
+
+	m = step(t, m, ui.OpenDetailMsg{Event: model.Event{Tag: "salt/job/x/ret/web-1"}})
+
+	if viewer.got.Tag != "salt/job/x/ret/web-1" {
+		t.Errorf("the Detail pane was handed %q, want the opened event", viewer.got.Tag)
+	}
+
+	// And the root focuses it, because an event opened on a pane nobody is
+	// looking at is not opened.
+	if !strings.Contains(m.View(), "[Detail]") {
+		t.Errorf("opening an event did not focus the Detail pane:\n%s", m.View())
+	}
+}
+
+// TestOpeningAJobReturnThatIsNotCachedSaysSo: the return may have been shed,
+// dropped, or hidden by the filter. All three are ordinary, and a key that
+// silently does nothing is indistinguishable from a broken one.
+func TestOpeningAJobReturnThatIsNotCachedSaysSo(t *testing.T) {
+	t.Parallel()
+
+	viewer := &viewerPane{stubPane: stubPane{title: "Detail"}}
+
+	m := ui.NewModel(stubSource{}, []ui.Pane{&stubPane{title: "Live"}, viewer}, ui.Options{
+		Theme: "gruvbox-dark", Interval: time.Hour,
+	})
+	m = ready(t, m, 100, 30)
+
+	m = step(t, m, ui.OpenJobReturnMsg{JID: "20260830081402123456", Minion: "web-041"})
+
+	view := ansi.Strip(m.View())
+
+	if !strings.Contains(view, "web-041") {
+		t.Errorf("the miss was not reported to the operator:\n%s", view)
+	}
+
+	if viewer.got.Tag != "" {
+		t.Errorf("Detail was handed a fabricated event: %+v", viewer.got)
+	}
+}
+
+// TestOpeningAJobReturnFindsItInTheSnapshot is the other half: when the return
+// IS cached, the pair resolves to the event and Detail gets it.
+func TestOpeningAJobReturnFindsItInTheSnapshot(t *testing.T) {
+	t.Parallel()
+
+	viewer := &viewerPane{stubPane: stubPane{title: "Detail"}}
+
+	want := model.Event{
+		Tag: "salt/job/20260830081402123456/ret/web-041", Kind: model.KindRet,
+		JID: "20260830081402123456", Minion: "web-041",
+	}
+
+	// A second, NEWER return for the same job from a different minion. Without
+	// it a root that matched on the JID alone would still find the right event
+	// by luck, and this test could not fail.
+	src := stubSource{snap: ui.Snapshot{Events: []model.Event{
+		{Tag: "salt/auth"},
+		want,
+		{
+			Tag: "salt/job/20260830081402123456/ret/web-999", Kind: model.KindRet,
+			JID: "20260830081402123456", Minion: "web-999",
+		},
+	}}}
+
+	m := ui.NewModel(src, []ui.Pane{&stubPane{title: "Live"}, viewer}, ui.Options{
+		Theme: "gruvbox-dark", Interval: time.Hour,
+	})
+	m = ready(t, m, 100, 30)
+	m = step(t, m, ui.TickMsg(time.Now()))
+
+	_ = step(t, m, ui.OpenJobReturnMsg{JID: want.JID, Minion: want.Minion})
+
+	if viewer.got.Tag != want.Tag {
+		t.Errorf("Detail was handed %q, want %q", viewer.got.Tag, want.Tag)
+	}
+}
+
+// TestExportRunsOffTheRenderLoopAndReportsBack: `w` is on the permanent hint
+// strip, so it must be bound; and the write must happen in a tea.Cmd rather
+// than inside Update, because a several-hundred-megabyte NDJSON write on the
+// render goroutine would freeze the frame (spec §10.3).
+func TestExportRunsOffTheRenderLoopAndReportsBack(t *testing.T) {
+	t.Parallel()
+
+	var gotQuery string
+
+	m := ui.NewModel(stubSource{}, []ui.Pane{&stubPane{title: "Live"}}, ui.Options{
+		Theme:    "gruvbox-dark",
+		Interval: time.Hour,
+		Filter:   mustQuery(t, "salt/auth"),
+		Export: func(q filter.Query) (string, error) {
+			gotQuery = q.String()
+
+			return "wrote 3 events to /var/tmp/salt-events.ndjson", nil
+		},
+	})
+	m = ready(t, m, 120, 30)
+
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
+	if cmd == nil {
+		t.Fatal("w returned no command: the advertised export key does nothing")
+	}
+
+	if gotQuery != "" {
+		t.Error("the export ran inside Update rather than in the command")
+	}
+
+	m = step(t, next.(ui.Model), cmd())
+
+	if gotQuery != "salt/auth" {
+		t.Errorf("export received query %q, want the active filter", gotQuery)
+	}
+
+	if !strings.Contains(ansi.Strip(m.View()), "wrote 3 events") {
+		t.Errorf("the export result never reached the operator:\n%s", ansi.Strip(m.View()))
+	}
+}
+
+// TestARefusedExportIsReported: the refusals are the feature. One that vanished
+// would leave the operator believing a file exists (invariant 8).
+func TestARefusedExportIsReported(t *testing.T) {
+	t.Parallel()
+
+	m := ui.NewModel(stubSource{}, []ui.Pane{&stubPane{title: "Live"}}, ui.Options{
+		Theme:    "gruvbox-dark",
+		Interval: time.Hour,
+		Export: func(filter.Query) (string, error) {
+			return "", errors.New("not enough free space to export safely")
+		},
+	})
+	m = ready(t, m, 120, 30)
+
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
+	m = step(t, next.(ui.Model), cmd())
+
+	if !strings.Contains(ansi.Strip(m.View()), "not enough free space") {
+		t.Errorf("the refusal never reached the operator:\n%s", ansi.Strip(m.View()))
+	}
+}
+
+// TestANoticeIsClearedByTheNextKeystroke: it reports what just happened, and a
+// stale one read as current is worse than none.
+func TestANoticeIsClearedByTheNextKeystroke(t *testing.T) {
+	t.Parallel()
+
+	m := ready(t, newModel(t), 120, 30)
+	m = step(t, m, ui.NoticeMsg("something happened"))
+
+	if !strings.Contains(ansi.Strip(m.View()), "something happened") {
+		t.Fatal("premise failed: the notice never rendered")
+	}
+
+	m = keys(t, m, "1")
+
+	if strings.Contains(ansi.Strip(m.View()), "something happened") {
+		t.Error("the notice survived a keystroke")
+	}
+}
+
+// TestHelpOverlayCarriesWhatIsOtherwiseUndiscoverable. Three things live here
+// because they exist nowhere else: the focused pane's own keys, the filter
+// language, and the resolved config path — spec §11 wants the last of these
+// visible so a config file that is not being read is diagnosable without
+// strace.
+func TestHelpOverlayCarriesWhatIsOtherwiseUndiscoverable(t *testing.T) {
+	t.Parallel()
+
+	panes := []ui.Pane{
+		&stubPane{title: "Live"},
+		&stubPane{title: "Rate", hints: []ui.KeyHint{{Key: "F", Label: "fix the scale"}}},
+	}
+
+	m := ui.NewModel(stubSource{}, panes, ui.Options{
+		Theme:      "gruvbox-dark",
+		Interval:   time.Hour,
+		SockPath:   "/var/run/salt/master/master_event_pub.ipc",
+		ConfigPath: "/home/operator/.config/salt-events/config.toml",
+	})
+	m = ready(t, m, 120, 40)
+
+	// Focus Rate, then open help: the overlay must report the FOCUSED pane's
+	// keys, not a fixed list.
+	m = keys(t, m, "2")
+
+	closed := ansi.Strip(m.View())
+	open := ansi.Strip(keys(t, m, "?").View())
+
+	// The pane's keys are ALSO on the hint line under the frame, so presence
+	// alone would pass against an overlay that lists nothing. What the overlay
+	// must do is add an occurrence.
+	if strings.Count(open, "fix the scale") <= strings.Count(closed, "fix the scale") {
+		t.Errorf("the overlay does not list the focused pane's keys:\n%s", open)
+	}
+
+	for _, want := range []string{
+		"minion:?*",
+		"/var/run/salt/master/master_event_pub.ipc",
+		"/home/operator/.config/salt-events/config.toml",
+	} {
+		if !strings.Contains(open, want) {
+			t.Errorf("the help overlay does not mention %q:\n%s", want, open)
+		}
+
+		// And it comes from the overlay, not from chrome that is always drawn.
+		if strings.Contains(closed, want) {
+			t.Errorf("%q is on screen with the overlay closed, so this proves nothing", want)
+		}
+	}
+}
+
+// mustQuery compiles a filter query for a test.
+func mustQuery(t *testing.T, s string) filter.Query {
+	t.Helper()
+
+	q, err := filter.Parse(s)
+	if err != nil {
+		t.Fatalf("parse %q: %v", s, err)
+	}
+
+	return q
 }

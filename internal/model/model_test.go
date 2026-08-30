@@ -111,3 +111,47 @@ func TestJobFailedCountsRetcodeAndSuccess(t *testing.T) {
 		t.Errorf("Failed() = %d, want 2", got)
 	}
 }
+
+// TestJobCloneSharesNothingWithTheOriginal is the guard on the one property
+// cmd/salt-events depends on: the UI renders from clones while the reader
+// goroutine keeps mutating the originals, so a clone that shared either map
+// would be a concurrent map access — a crash, not a race.
+func TestJobCloneSharesNothingWithTheOriginal(t *testing.T) {
+	t.Parallel()
+
+	j := model.NewJob("20260830081402123456")
+	j.ExpectedState = model.ExpectedKnown
+	j.Fun = "state.apply"
+	j.AddExpected("web-1")
+	j.AddExpected("web-2")
+	j.AddReturn(model.RetInfo{Minion: "web-1", Success: true})
+
+	clone := j.Clone()
+
+	// Everything the original knew must survive the copy, including the
+	// denominator: a clone that lost it would render 1/? for a job we hold a
+	// full expected set for (invariant 10, in reverse).
+	if n, state := clone.ExpectedCount(); n != 2 || state != model.ExpectedKnown {
+		t.Errorf("clone ExpectedCount() = (%d, %v), want (2, known)", n, state)
+	}
+
+	if clone.Fun != "state.apply" || clone.Returned() != 1 {
+		t.Errorf("clone lost scalar state: fun=%q returned=%d", clone.Fun, clone.Returned())
+	}
+
+	// Now mutate the original the way ingest does.
+	j.AddExpected("web-3")
+	j.AddReturn(model.RetInfo{Minion: "web-2", Success: false})
+
+	if n, _ := clone.ExpectedCount(); n != 2 {
+		t.Errorf("clone expected set = %d after the original grew, want 2", n)
+	}
+
+	if got := clone.Returned(); got != 1 {
+		t.Errorf("clone Returned() = %d after the original grew, want 1", got)
+	}
+
+	if got := clone.Failed(); got != 0 {
+		t.Errorf("clone Failed() = %d after the original gained a failure, want 0", got)
+	}
+}

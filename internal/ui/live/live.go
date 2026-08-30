@@ -56,6 +56,7 @@ func (p *Pane) Keys() []ui.KeyHint {
 		{Key: "↑/↓", Label: "move cursor"},
 		{Key: "g", Label: "jump to oldest"},
 		follow,
+		{Key: "enter", Label: "open in Detail"},
 	}
 }
 
@@ -90,9 +91,29 @@ func (p *Pane) Update(msg tea.Msg, s ui.Snapshot) (ui.Pane, tea.Cmd) {
 		p.cursor, p.follow = last, true
 	case "g", "home":
 		p.cursor, p.follow = 0, false
+	case "enter":
+		return p, p.openSelected(s)
 	}
 
 	return p, nil
+}
+
+// openSelected asks the ROOT to show the highlighted event in Detail
+// (spec §7.2). The pane cannot reach Detail itself — panes are handed to the
+// root as an opaque slice — so this is a message the root routes, and it is
+// nil when there is nothing selected rather than a command that opens an empty
+// event.
+//
+// The event is carried by value. Detail holds its selection until it is
+// replaced, and a pointer into the snapshot would keep that whole snapshot's
+// events alive for as long as the operator left the pane open.
+func (p *Pane) openSelected(s ui.Snapshot) tea.Cmd {
+	e, ok := p.Selected(s)
+	if !ok {
+		return nil
+	}
+
+	return func() tea.Msg { return ui.OpenDetailMsg{Event: e} }
 }
 
 // cursorIn resolves the cursor against s.

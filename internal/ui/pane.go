@@ -3,6 +3,7 @@ package ui
 import (
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/TKC-Labs/go-salt-events/internal/model"
 	"github.com/TKC-Labs/go-salt-events/internal/theme"
 )
 
@@ -67,6 +68,31 @@ type Pane interface {
 	// comes back, so the Rate pane's `F` toggle (spec §9) cannot ship
 	// undiscoverable.
 	Keys() []KeyHint
+}
+
+// EventViewer is implemented by the pane that can display a single event —
+// Detail, and only Detail (spec §7.2, invariant 4: it is the one place a
+// payload is fully decoded).
+//
+// The root discovers it by type assertion rather than by index, so a build that
+// omits Detail loses the drill-through and nothing else, and so no pane needs
+// to know which slot another pane occupies.
+type EventViewer interface {
+	Pane
+
+	// SetEvent selects the event to display.
+	SetEvent(e model.Event)
+}
+
+// JobPinner is implemented by a pane that is holding one job open and needs it
+// kept out of the job index's eviction path — Jobs, while it is drilled in.
+//
+// It reports the state every tick rather than emitting pin and unpin events:
+// the pin is a level, not an edge, so a missed message would leave a job pinned
+// forever and quietly shrink the index by one.
+type JobPinner interface {
+	// PinnedJID is the job to protect, or "" when nothing is pinned.
+	PinnedJID() string
 }
 
 // KeyHint is one pane-owned key and what it does, as shown on the hint line.

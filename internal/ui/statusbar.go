@@ -5,6 +5,8 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/TKC-Labs/go-salt-events/internal/ui/components"
 )
 
 const (
@@ -98,21 +100,119 @@ func (m Model) hintCell(key, label string) string {
 // helpView replaces the pane body while `?` is held open, rather than
 // overlaying it. An overlay would have to be composited over content it does
 // not own, and at 10Hz any mistake in that composite strobes.
+//
+// It carries three things beyond the global keys, each because it is otherwise
+// undiscoverable:
+//
+//   - the FOCUSED pane's own Keys(), which are the ones an operator cannot
+//     already know — the global block is the same on every pane and is learnt
+//     once;
+//   - the filter language, including the one piece of it that reliably
+//     surprises people: `minion:*` matches events with NO minion as well, and
+//     `minion:?*` is the "has a minion" spelling;
+//   - the resolved socket and config paths, so a config file that is not being
+//     read is diagnosable without strace (spec §11).
 func (m Model) helpView(w, h int) string {
-	lines := make([]string, 0, len(hints)+1)
-	lines = append(lines, m.styles.Header.Render("keys"))
+	lines := m.helpKeyLines(w)
 
-	for _, hint := range hints {
-		lines = append(lines,
-			m.styles.KeyLabel.Render(fmt.Sprintf("%8s", hint[0]))+
-				m.styles.Value.Render("  "+hint[1]))
+	lines = append(lines, "", m.helpHeader("filter language  (/ to edit, esc to cancel)", w))
+
+	for _, row := range filterHelp {
+		lines = append(lines, m.helpRow(row[0], row[1], w))
 	}
+
+	lines = append(lines, "", m.helpHeader("this session", w))
+	lines = append(lines,
+		m.helpRow("socket", pathOrNone(m.sockPath), w),
+		m.helpRow("config", pathOrNone(m.configPath), w))
 
 	if len(lines) > h {
 		lines = lines[:h]
 	}
 
-	return lipgloss.NewStyle().MaxWidth(w).Render(strings.Join(lines, "\n"))
+	return strings.Join(lines, "\n")
+}
+
+// helpKeyLines renders the global block followed by the focused pane's own.
+//
+// The pane's keys are here because the `?` overlay is where an operator looks
+// for a complete list, and the hint line under the frame truncates first.
+func (m Model) helpKeyLines(w int) []string {
+	lines := make([]string, 0, len(hints)+len(filterHelp)+helpExtraLines)
+	lines = append(lines, m.helpHeader("keys", w))
+
+	for _, hint := range hints {
+		lines = append(lines, m.helpRow(hint[0], hint[1], w))
+	}
+
+	if len(m.panes) == 0 || m.focus < 0 || m.focus >= len(m.panes) {
+		return lines
+	}
+
+	pane := m.panes[m.focus]
+
+	keys := pane.Keys()
+	if len(keys) == 0 {
+		return lines
+	}
+
+	lines = append(lines, "", m.helpHeader(pane.Title()+" pane", w))
+	for _, k := range keys {
+		lines = append(lines, m.helpRow(k.Key, k.Label, w))
+	}
+
+	return lines
+}
+
+// helpHeader renders one section heading, fitted like every other line.
+func (m Model) helpHeader(text string, w int) string {
+	return m.styles.Header.Render(components.Fit(components.Sanitise(text), w))
+}
+
+// helpKeyColumn is the width the key column is padded to. The label column then
+// starts in the same place on every row, which is what makes the block
+// scannable rather than a list of sentences.
+//
+// It must be at least as wide as the longest key printed in it — the filter
+// examples, not the keystrokes — because PadTo TRUNCATES an over-long value.
+// A narrower column silently renders `minion:?*` as `minion:?`, which is a
+// different and valid query, so the overlay would be teaching the wrong thing.
+const helpKeyColumn = 14
+
+// helpExtraLines is the headroom helpKeyLines leaves for the section headers,
+// blank separators and path rows appended after the key block. It only sizes
+// the initial allocation.
+const helpExtraLines = 12
+
+// helpRow renders one key/label pair, fitted so a narrow window truncates
+// rather than wrapping — lipgloss Height is a MINIMUM, so a wrapped line grows
+// the root's frame and pushes the status bar off the bottom of the terminal.
+func (m Model) helpRow(key, label string, w int) string {
+	col := min(helpKeyColumn, max(0, w))
+
+	return m.styles.KeyLabel.Render(components.PadTo(components.Sanitise(key), col)) +
+		m.styles.Value.Render(components.Fit("  "+components.Sanitise(label), w-col))
+}
+
+// filterHelp is the query language, in the order an operator meets it
+// (spec §6).
+var filterHelp = [...][2]string{
+	{"salt/job/*", "a bare term is a TAG GLOB, fnmatch — Salt's own semantics"},
+	{"minion:web-1", "field term; terms are space-separated and AND together"},
+	{"fields", "minion: jid: fun: ok: ns: kind:"},
+	{"minion:*", "matches events with NO minion too — * matches the empty field"},
+	{"minion:?*", "the \"has a minion\" spelling: one character, then anything"},
+	{"ok:false", "only failed returns"},
+}
+
+// pathOrNone renders a resolved path, or says it was never resolved. An empty
+// line here would read as a path of "", which is a real and different thing.
+func pathOrNone(p string) string {
+	if p == "" {
+		return "(none)"
+	}
+
+	return components.Sanitise(p)
 }
 
 // filterBarView shows the active query, or the editor, or a parse error.
@@ -124,6 +224,12 @@ func (m Model) filterBarView(w int) string {
 		return style.Render(m.styles.Err.Render("filter: " + m.filterErr))
 	case m.filtering:
 		return style.Render(m.styles.Value.Render("/" + m.filterBuf + "▏"))
+	case m.notice != "":
+		// Sanitised because a notice can quote a minion ID or a JID straight
+		// off the bus, and this tool runs as root: a raw ESC in a tag would
+		// otherwise reach the operator's terminal (components.Sanitise, by
+		// ruling — there is one implementation of this).
+		return style.Render(m.styles.Warn.Render(components.Sanitise(m.notice)))
 	case !m.query.IsZero():
 		return style.Render(m.styles.Muted.Render("filter: " + m.query.String()))
 	default:

@@ -135,6 +135,34 @@ func (j *Job) Returns() []RetInfo {
 	return out
 }
 
+// Clone returns a deep copy that shares no state with j.
+//
+// This exists for the ingest hub (cmd/salt-events). A Job is mutated in place
+// by the reader goroutine as returns arrive, so handing the live pointer to the
+// UI would let a pane read `returns` while ingest writes it — a concurrent map
+// access, which crashes the process outright rather than merely racing. The
+// snapshot the UI renders from must therefore carry copies (spec §4.1).
+//
+// It lives here because the two sets are unexported: no caller outside this
+// package can reconstruct `expected` — Missing() only reveals the part of it
+// that has not returned — so a copy assembled from the accessors would silently
+// invent a denominator, which is exactly what invariant 10 forbids.
+func (j *Job) Clone() *Job {
+	out := *j
+
+	out.expected = make(map[string]struct{}, len(j.expected))
+	for m := range j.expected {
+		out.expected[m] = struct{}{}
+	}
+
+	out.returns = make(map[string]RetInfo, len(j.returns))
+	for m, r := range j.returns {
+		out.returns[m] = r
+	}
+
+	return &out
+}
+
 // Complete reports whether every expected minion has returned. It is false
 // whenever the expected set is unknown — an unknown denominator can never
 // prove completeness.

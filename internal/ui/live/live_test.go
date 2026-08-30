@@ -256,20 +256,38 @@ func TestLiveKeysAdvertiseWhatItBinds(t *testing.T) {
 		}
 	}
 
-	for _, want := range []string{"↑/↓", "g", "G"} {
+	for _, want := range []string{"↑/↓", "g", "G", "enter"} {
 		if !listed[want] {
 			t.Errorf("Keys() does not advertise %q", want)
 		}
 	}
 
-	// It reports what is true NOW, not a fixed list (ui.Pane.Keys).
-	following := p.Keys()
+	// It reports what is true NOW, not a fixed list (ui.Pane.Keys). The hint is
+	// found by KEY rather than by position: the list has grown once already,
+	// and an assertion on the last element silently starts testing a different
+	// hint when it grows again.
+	following := hintFor(t, p.Keys(), "G")
 
 	p.Update(tea.KeyMsg{Type: tea.KeyUp}, snap(model.Event{Tag: "salt/a"}))
 
-	if scrolledBack := p.Keys(); scrolledBack[len(scrolledBack)-1] == following[len(following)-1] {
-		t.Error("the follow hint reads the same whether or not the pane is following")
+	if scrolledBack := hintFor(t, p.Keys(), "G"); scrolledBack == following {
+		t.Errorf("the follow hint reads %q whether or not the pane is following", following)
 	}
+}
+
+// hintFor returns the label bound to key, failing if it is not advertised.
+func hintFor(t *testing.T, hints []ui.KeyHint, key string) string {
+	t.Helper()
+
+	for _, h := range hints {
+		if h.Key == key {
+			return h.Label
+		}
+	}
+
+	t.Fatalf("Keys() does not advertise %q", key)
+
+	return ""
 }
 
 // TestLiveStylesItsOwnOutput is the pane-level theme guard.
@@ -333,5 +351,50 @@ func TestLiveSanitisesHostileTagText(t *testing.T) {
 
 	if n := len(strings.Split(got, "\n")); n > 6 {
 		t.Errorf("a newline in a tag split the row: %d lines", n)
+	}
+}
+
+// TestLiveEnterOpensTheSelectedEvent is the drill-through of spec §7.2 from
+// this side. The pane cannot reach the Detail pane, so what it must do is emit
+// a message naming the event the cursor is on — and it must be the SELECTED
+// event, not the newest or the first.
+func TestLiveEnterOpensTheSelectedEvent(t *testing.T) {
+	t.Parallel()
+
+	s := snap(
+		model.Event{Tag: "salt/one", Arrival: time.Now()},
+		model.Event{Tag: "salt/two", Arrival: time.Now()},
+		model.Event{Tag: "salt/three", Arrival: time.Now()},
+	)
+
+	p := live.New()
+
+	// Follow puts the cursor on the newest; one `up` moves it to "salt/two",
+	// which is what distinguishes "opens the selection" from "opens the tail".
+	pane, _ := p.Update(tea.KeyMsg{Type: tea.KeyUp}, s)
+
+	_, cmd := pane.Update(tea.KeyMsg{Type: tea.KeyEnter}, s)
+	if cmd == nil {
+		t.Fatal("enter returned no command: the drill-through is unbound")
+	}
+
+	open, ok := cmd().(ui.OpenDetailMsg)
+	if !ok {
+		t.Fatalf("enter emitted %T, want ui.OpenDetailMsg", cmd())
+	}
+
+	if open.Event.Tag != "salt/two" {
+		t.Errorf("enter opened %q, want the selected event salt/two", open.Event.Tag)
+	}
+}
+
+// TestLiveEnterOnAnEmptyTailEmitsNothing: there is no event to open before the
+// first snapshot arrives, and opening the zero Event would show the Detail
+// pane a tagless event that never existed.
+func TestLiveEnterOnAnEmptyTailEmitsNothing(t *testing.T) {
+	t.Parallel()
+
+	if _, cmd := live.New().Update(tea.KeyMsg{Type: tea.KeyEnter}, snap()); cmd != nil {
+		t.Errorf("enter on an empty tail emitted %v, want no command", cmd())
 	}
 }

@@ -7,8 +7,18 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/TKC-Labs/go-salt-events/internal/filter"
+	"github.com/TKC-Labs/go-salt-events/internal/model"
 	"github.com/TKC-Labs/go-salt-events/internal/theme"
 )
+
+// ExportFunc writes the currently filtered event set and reports, in one line,
+// what it did or why it refused.
+//
+// It is injected rather than imported because internal/export resolves a
+// destination, checks free space and chowns to $SUDO_USER — all of which is the
+// wiring layer's business, not the UI's. The root only knows that `w` runs it
+// OFF the render loop (spec §10.3) and that the answer is one line of text.
+type ExportFunc func(q filter.Query) (string, error)
 
 // Options configures the root model.
 type Options struct {
@@ -16,6 +26,16 @@ type Options struct {
 	Interval time.Duration
 	Filter   filter.Query
 	SockPath string
+
+	// ConfigPath is the config file the session resolved, shown in the help
+	// overlay so a config that is not being read is diagnosable without strace
+	// (spec §11). It is the path that WOULD be read, whether or not it exists.
+	ConfigPath string
+
+	// Export is what `w` runs. A nil Export leaves the key bound to a
+	// diagnostic rather than to nothing: `w` is on the permanent hint strip, so
+	// a build without an exporter must say so rather than appear broken.
+	Export ExportFunc
 }
 
 // Model is the bubbletea root. It owns focus, the tick, and the single active
@@ -35,8 +55,15 @@ type Model struct {
 
 	snap Snapshot
 
-	interval time.Duration
-	sockPath string
+	// notice is a one-line transient message — an export result, or the reason
+	// a drill-through found nothing. It is cleared by the next keystroke, so it
+	// cannot linger and be read as current.
+	notice string
+
+	interval   time.Duration
+	sockPath   string
+	configPath string
+	export     ExportFunc
 
 	width, height int
 
@@ -75,13 +102,15 @@ func NewModel(src Source, panes []Pane, opts Options) Model {
 	}
 
 	return Model{
-		src:       src,
-		panes:     panes,
-		styles:    st,
-		themeName: name,
-		query:     opts.Filter,
-		interval:  interval,
-		sockPath:  opts.SockPath,
+		src:        src,
+		panes:      panes,
+		styles:     st,
+		themeName:  name,
+		query:      opts.Filter,
+		interval:   interval,
+		sockPath:   opts.SockPath,
+		configPath: opts.ConfigPath,
+		export:     opts.Export,
 	}
 }
 
@@ -113,6 +142,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case TickMsg:
+		// The pin is synced even while paused. Pausing freezes what the
+		// operator is LOOKING at, and the job they are looking at is precisely
+		// the one that must not be evicted out from under them (spec §7.5).
+		m.syncPin()
+
 		// Pausing freezes the VIEW, never ingest — a paused UI that stopped
 		// collecting would silently lose the storm the operator paused to
 		// read (invariant 7). The reader goroutine is untouched here; all this
@@ -125,9 +159,97 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		return m.handleKey(msg)
+
+	// The three cases below are why Update has a message switch at all beyond
+	// keys and ticks: without them a tea.Cmd returned by a pane is delivered
+	// straight back to the FOCUSED pane by the default arm and can never reach
+	// the root, which is what left the drill-through of spec §7.2 unbindable.
+	case OpenDetailMsg:
+		return m.openDetail(msg.Event), nil
+
+	case OpenJobReturnMsg:
+		return m.openJobReturn(msg), nil
+
+	case NoticeMsg:
+		m.notice = string(msg)
+
+		return m, nil
 	}
 
 	return m.routeToPane(msg)
+}
+
+// syncPin tells the source which job a pane is holding open, every tick.
+//
+// It is a level rather than an edge — see JobPinner — and it is re-asserted on
+// every tick because the alternative is a pin that survives the pane that set
+// it. A Source that cannot pin is the ordinary case in tests and costs nothing.
+func (m Model) syncPin() {
+	pinner, ok := m.src.(Pinner)
+	if !ok {
+		return
+	}
+
+	pinner.PinJob(m.pinnedJID())
+}
+
+// pinnedJID is the first job any pane is holding open, or "".
+func (m Model) pinnedJID() string {
+	for _, p := range m.panes {
+		holder, ok := p.(JobPinner)
+		if !ok {
+			continue
+		}
+
+		if jid := holder.PinnedJID(); jid != "" {
+			return jid
+		}
+	}
+
+	return ""
+}
+
+// openDetail hands an event to the Detail pane and focuses it.
+func (m Model) openDetail(e model.Event) Model {
+	for i, p := range m.panes {
+		viewer, ok := p.(EventViewer)
+		if !ok {
+			continue
+		}
+
+		viewer.SetEvent(e)
+		m.focus, m.showHelp = i, false
+
+		return m
+	}
+
+	m.notice = "this build has no Detail pane"
+
+	return m
+}
+
+// openJobReturn resolves a job/minion pair against the snapshot in hand.
+//
+// The scan is newest-first because a minion may return twice for one JID and
+// the later return is the current answer. It is O(snapshot), not O(cache), and
+// runs once per keypress rather than per frame.
+//
+// A miss is reported rather than ignored: the return may have been shed by the
+// budget, dropped entirely, or simply hidden by the active filter, and all
+// three are ordinary. A key that silently does nothing is indistinguishable
+// from a broken one.
+func (m Model) openJobReturn(msg OpenJobReturnMsg) Model {
+	for i := len(m.snap.Events) - 1; i >= 0; i-- {
+		e := m.snap.Events[i]
+		if e.Kind == model.KindRet && e.JID == msg.JID && e.Minion == msg.Minion {
+			return m.openDetail(e)
+		}
+	}
+
+	m.notice = "no cached return from " + msg.Minion + " for job " + msg.JID +
+		" — it may have aged out of the cache, or the active filter hides it"
+
+	return m
 }
 
 // refresh pulls a snapshot, tolerating a nil Source so a model can be built
@@ -145,6 +267,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.filtering {
 		return m.handleFilterKey(msg)
 	}
+
+	// Any keystroke clears the notice: it reports what just happened, and a
+	// stale one read as current would be worse than none.
+	m.notice = ""
 
 	key := msg.String()
 
@@ -175,6 +301,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.showHelp = !m.showHelp
 
 		return m, nil
+	case keyExport:
+		return m, m.exportCmd()
 	}
 
 	return m.routeToPane(msg)
@@ -239,6 +367,34 @@ func (m Model) commitFilter() (tea.Model, tea.Cmd) {
 	m.snap = m.refresh()
 
 	return m, nil
+}
+
+// exportCmd runs the export as a tea.Cmd — i.e. on bubbletea's own goroutine,
+// OFF the render loop, so a multi-hundred-megabyte NDJSON write cannot stall
+// the frame (spec §10.3). Ingest is untouched throughout: the exporter reads a
+// copy taken under the ingest lock, it does not hold that lock while writing.
+//
+// The whole answer, including a refusal, comes back as one notice line. The
+// modal of spec §10.2 is not built here; the refusal text carries the estimate,
+// the space available and the headroom rule, which is the part that tells the
+// operator what to do.
+func (m Model) exportCmd() tea.Cmd {
+	if m.export == nil {
+		return func() tea.Msg { return NoticeMsg("export is not wired into this build") }
+	}
+
+	// Captured by value: Model is copied on every Update, and the closure must
+	// not read fields off a Model that has since moved on.
+	export, q := m.export, m.query
+
+	return func() tea.Msg {
+		note, err := export(q)
+		if err != nil {
+			return NoticeMsg("export refused: " + err.Error())
+		}
+
+		return NoticeMsg(note)
+	}
 }
 
 // cycleTheme switches palettes live.

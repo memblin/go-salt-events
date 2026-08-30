@@ -14,6 +14,7 @@ const (
 	keyPause     = " "
 	keyFilter    = "/"
 	keyHelp      = "?"
+	keyExport    = "w"
 	keyEscape    = "esc"
 	keyEnter     = "enter"
 	keyBackspace = "backspace"
@@ -25,16 +26,16 @@ const firstPaneDigit = '1'
 
 // hints keeps the global keys permanently on screen. A read-only console is
 // often someone's first contact with the tool during an incident, and a key
-// you cannot see is a key you do not press. `w` (export) is listed even though
-// Task 20 owns it, because the strip is the contract the other tasks render
-// against.
+// you cannot see is a key you do not press. Every entry here is bound in
+// handleKey: a hint strip that advertises a key nothing handles is worse than
+// a shorter strip.
 var hints = [...][2]string{
 	{"1-5", "pane"},
 	{keyNextPane, "next"},
 	{keyTheme, "theme"},
 	{keyFilter, "filter"},
 	{"space", "pause"},
-	{"w", "export"},
+	{keyExport, "export"},
 	{keyHelp, "help"},
 	{keyQuit, "quit"},
 }

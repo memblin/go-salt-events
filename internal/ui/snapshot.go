@@ -17,6 +17,8 @@
 package ui
 
 import (
+	"time"
+
 	"github.com/TKC-Labs/go-salt-events/internal/cache"
 	"github.com/TKC-Labs/go-salt-events/internal/filter"
 	"github.com/TKC-Labs/go-salt-events/internal/model"
@@ -29,6 +31,21 @@ import (
 // Panes must not hold a reference to the cache or the stats: that is what
 // keeps rendering independent of ingest rate (spec §4.1, invariant 6).
 type Snapshot struct {
+	// Now is the moment this snapshot was assembled, read under the ingest lock
+	// from the SAME clock that stamps event arrival. It is what lets a job that
+	// is still returning count its duration up live between ticks (spec §7.5)
+	// without any pane reaching for the wall clock itself.
+	//
+	// It is never Salt's _stamp, which is set by whichever process fired the
+	// event: mixing a skewed minion clock into a duration computed against
+	// arrival times would produce negative and jumping durations (spec §4.3,
+	// invariant 2).
+	//
+	// It is the zero Time in a snapshot assembled without a clock — including
+	// every snapshot a pane sees before the first tick — and consumers must
+	// treat that as "no reading available" rather than as the epoch.
+	Now time.Time
+
 	Events []model.Event
 
 	Cache cache.Stats
@@ -64,4 +81,18 @@ type Snapshot struct {
 // size.
 type Source interface {
 	Snapshot(q filter.Query, limit int) Snapshot
+}
+
+// Pinner is the optional half of Source: a source whose job index can hold one
+// job out of the eviction path.
+//
+// It is separate from Source, and asserted for rather than required, because
+// pinning is a property of the ingest side that a test double has no reason to
+// implement. The root calls it once per tick with whatever a pane reports
+// through JobPinner — a job disappearing out from under the cursor while it is
+// being read is the worst possible moment to lose it (spec §7.5), and the job
+// index cannot know which job that is.
+type Pinner interface {
+	// PinJob pins jid, or clears the pin when jid is empty.
+	PinJob(jid string)
 }
