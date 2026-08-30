@@ -149,12 +149,22 @@ jobs:
         env:
           GH_REF_NAME: ${{ github.ref_name }}
         run: |
-          # ref_name is the tag (e.g. v0.1.0). The binary and the packages must
-          # agree, so both read this one value: `just package` passes VERSION to
-          # the linker and to nfpm.
+          # ref_name is the tag (e.g. v0.1.0). rpm and deb both reject a leading
+          # 'v' in a version field, so `bare` strips it.
           #
-          # rpm and deb both reject a leading 'v' in a version field, so strip it
-          # for packaging while the binary keeps the tag verbatim.
+          # `bare` is what `just package` receives, so it reaches BOTH nfpm and
+          # the linker: the binary reports 0.1.0, not v0.1.0. That is deliberate
+          # -- one value everywhere means `salt-events --version` and `rpm -q`
+          # cannot disagree about which build you have.
+          #
+          # `tag` is used only for the git ref and the release title, where the
+          # leading v is the convention.
+          #
+          # nfpm additionally rewrites a prerelease suffix, so v0.0.1-rc1 becomes
+          # 0.0.1~rc1 in the package name. That is correct and load-bearing: in
+          # both rpm and deb ordering '~' sorts BEFORE the empty string, so
+          # 0.0.1~rc1 < 0.0.1 and an upgrade from a release candidate to the
+          # real release works. A hyphen would sort after and block it.
           echo "tag=${GH_REF_NAME}" >> "${GITHUB_OUTPUT}"
           echo "bare=${GH_REF_NAME#v}" >> "${GITHUB_OUTPUT}"
 
