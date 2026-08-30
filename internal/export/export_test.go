@@ -78,6 +78,28 @@ func assertDirIsEmpty(t *testing.T, dir string) {
 	}
 }
 
+// partialSize reports the size of the in-progress export, so a mid-write test
+// can prove bytes really reached the platter instead of assuming it.
+func partialSize(t *testing.T, dir string) int64 {
+	t.Helper()
+
+	matches, err := filepath.Glob(filepath.Join(dir, "*.partial"))
+	if err != nil || len(matches) != 1 {
+		t.Errorf("want exactly one .partial in %s, got %v (%v)", dir, matches, err)
+
+		return 0
+	}
+
+	info, err := os.Stat(matches[0])
+	if err != nil {
+		t.Errorf("Stat %s: %v", matches[0], err)
+
+		return 0
+	}
+
+	return info.Size()
+}
+
 func TestWriteProducesATimestampedFile(t *testing.T) {
 	t.Parallel()
 
@@ -380,23 +402,33 @@ func TestWriteDefaultsAMissingClock(t *testing.T) {
 func TestWriteLeavesNothingBehindAfterBytesHaveReachedDisk(t *testing.T) {
 	t.Parallel()
 
-	// The dangerous case is a failure AFTER real bytes are on disk: the events
-	// here are far larger than the write buffer, so the first ones are flushed
-	// to the .partial before the failure lands.
+	// The dangerous case is a failure AFTER real bytes are on disk. Decode here
+	// returns the payload itself rather than its length, so each record encodes
+	// to ~64 KiB and the first three are long past the 4 KiB bufio buffer by the
+	// time the fourth fails. onDisk is captured at the moment of the failure so
+	// this test proves that rather than merely asserting it.
 	opts := roomyOpts(t)
+
+	var onDisk int64
 
 	calls := 0
 	opts.Decode = func(b []byte) (any, error) {
 		calls++
 		if calls > 3 {
+			onDisk = partialSize(t, opts.Dir)
+
 			return nil, errors.New("decode blew up mid-export")
 		}
 
-		return map[string]any{"len": len(b)}, nil
+		return string(b), nil
 	}
 
 	if _, err := export.Write(events(10, 64<<10), opts); err == nil {
 		t.Fatal("expected an error")
+	}
+
+	if onDisk <= 0 {
+		t.Errorf("no bytes had reached the .partial, so this is not the mid-write case")
 	}
 
 	assertDirIsEmpty(t, opts.Dir)
@@ -405,12 +437,18 @@ func TestWriteLeavesNothingBehindAfterBytesHaveReachedDisk(t *testing.T) {
 func TestWriteAbortsMidStreamOnTheHardCap(t *testing.T) {
 	t.Parallel()
 
-	// The estimate can be wrong in the safe-looking direction — tiny payloads
-	// expand into fat JSON records. The cap has to bound the actual write, not
+	// The estimate can still be wrong in the safe-looking direction: a payload
+	// of control bytes expands six-for-one when encoded (each NUL becomes a
+	// six-character escape in the JSON string), an expansion no per-record
+	// floor can bound. The cap therefore has to bound the actual write, not
 	// just the guess, and abort the same way ENOSPC does (spec §10.3).
-	evs := events(200, 0)
+	evs := events(20, 0)
+	for i := range evs {
+		evs[i].Payload = make([]byte, 1024) // all NUL
+	}
 
 	opts := roomyOpts(t)
+	opts.Decode = func(b []byte) (any, error) { return string(b), nil }
 	opts.Max = export.Estimate(evs) + 1 // passes the pre-flight, fails mid-write
 
 	_, err := export.Write(evs, opts)
@@ -675,7 +713,10 @@ func TestEstimateIsDeliberatelyPessimistic(t *testing.T) {
 	t.Parallel()
 
 	// Over-estimating costs a declined export; under-estimating costs a full
-	// disk on a production master (spec §10.2).
+	// disk on a production master (spec §10.2). Each event carries a 160-byte
+	// envelope floor on top of §10.2's tag+payload sum before the 2.0 factor,
+	// because the timestamp, the JSON keys and the two truncation flags are
+	// real bytes that §10.2's formula does not count.
 	tests := []struct {
 		name string
 		evs  []model.Event
@@ -683,19 +724,19 @@ func TestEstimateIsDeliberatelyPessimistic(t *testing.T) {
 	}{
 		{name: "nothing selected", evs: nil, want: 0},
 		{
-			name: "tag plus payload, doubled",
+			name: "tag plus payload plus the envelope, doubled",
 			evs:  []model.Event{{Tag: "salt/a", Payload: bytes.Repeat([]byte("x"), 94)}},
-			want: 200,
+			want: (6 + 94 + 160) * 2,
 		},
 		{
-			name: "a shed payload still costs its tag",
+			name: "a shed payload still costs its tag and its envelope",
 			evs:  []model.Event{{Tag: "salt/abcd", Shed: true}},
-			want: 18,
+			want: (9 + 160) * 2,
 		},
 		{
 			name: "sums across events",
 			evs:  []model.Event{{Tag: "ab"}, {Tag: "cd"}, {Tag: "ef"}},
-			want: 12,
+			want: 3 * (2 + 160) * 2,
 		},
 	}
 
@@ -705,6 +746,67 @@ func TestEstimateIsDeliberatelyPessimistic(t *testing.T) {
 
 			if got := export.Estimate(tt.evs); got != tt.want {
 				t.Errorf("Estimate = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEstimateCoversTheBytesActuallyWritten(t *testing.T) {
+	t.Parallel()
+
+	// A pre-flight is only worth having if the number it checks bounds the real
+	// write. Spec §10.2's bare tag+payload sum under-shot these two shapes by
+	// 2.1x and 10.2x measured, because it counts none of the record envelope.
+	// Pinned as ">= what was actually written", not as a ratio: the margin is
+	// allowed to move, the direction is not.
+	shed := make([]model.Event, 0, 1000)
+
+	for range 1000 {
+		shed = append(shed, model.Event{
+			Arrival: time.Date(2026, 8, 30, 8, 14, 2, 0, time.UTC),
+			Tag:     "salt/a",
+			Shed:    true,
+		})
+	}
+
+	tests := []struct {
+		name string
+		evs  []model.Event
+	}{
+		{name: "many small events with no payload", evs: events(200, 0)},
+		{name: "shed events, where only the tag survives", evs: shed},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			opts := roomyOpts(t)
+
+			est := export.Estimate(tt.evs)
+
+			got, err := export.Write(tt.evs, opts)
+			if err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+
+			info, err := os.Stat(got.Path)
+			if err != nil {
+				t.Fatalf("Stat: %v", err)
+			}
+
+			t.Logf("estimate %d, wrote %d (%.2fx)", est, info.Size(),
+				float64(est)/float64(info.Size()))
+
+			if est < info.Size() {
+				t.Errorf(
+					"Estimate = %d but the export is %d bytes on disk: the pre-flight "+
+						"would let this write start and then run out of room",
+					est, info.Size())
+			}
+
+			if est < got.Bytes {
+				t.Errorf("Estimate = %d, but Write reported %d bytes", est, got.Bytes)
 			}
 		})
 	}

@@ -42,6 +42,24 @@ var errUnusableOptions = errors.New("export options are unusable")
 // a full disk on a production master.
 const jsonExpansion = 2.0
 
+// recordOverhead is the per-event floor added to the raw byte count before
+// jsonExpansion is applied.
+//
+// Spec §10.2's formula is Σ(len(tag)+len(payload)), which omits the fixed cost
+// of the record envelope entirely: the RFC3339Nano arrival timestamp, the JSON
+// keys, and the two truncation flags come to roughly 120-165 bytes for a real
+// event even when the payload is empty. Without this floor a large selection of
+// small events under-estimates by ~2.1x and a selection of shed events (whose
+// payload is gone, so §10.2's sum is just the tag) by ~10x — which is exactly
+// the ENOSPC on a production master that the pre-flight exists to prevent.
+//
+// 160 is a deliberate over-estimate, and it stays spec-compatible because it
+// can only ever RAISE the number: it can never permit a write §10.2's formula
+// would have refused, only refuse one §10.2's formula would have permitted.
+// Do not "clean this up" into the tag/payload sum — an over-estimate costs a
+// declined export, an under-estimate costs the master.
+const recordOverhead = 160
+
 // minHeadroom is the floor on space that must remain after the write.
 const minHeadroom = 1 << 30 // 1 GiB
 
@@ -118,11 +136,14 @@ type record struct {
 }
 
 // Estimate returns the pessimistic encoded size of events.
+//
+// This is spec §10.2's sum plus recordOverhead per event; see that constant for
+// why the bare §10.2 formula under-shoots the encoded size by 2-10x.
 func Estimate(events []model.Event) int64 {
 	var raw int64
 
 	for _, e := range events {
-		raw += int64(len(e.Tag) + len(e.Payload))
+		raw += int64(len(e.Tag)+len(e.Payload)) + recordOverhead
 	}
 
 	return int64(float64(raw) * jsonExpansion)
