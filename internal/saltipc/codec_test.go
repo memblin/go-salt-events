@@ -118,6 +118,105 @@ func TestDecodeValueHandlesSaltExtTypes(t *testing.T) {
 	}
 }
 
+// extBytes wraps a raw ext body in msgpack's ext8 header (0xc7, len, type).
+// ext8 accepts any length 0-255, including ones a fixext size would also
+// cover, so it is a safe, uniform choice for hand-built test payloads.
+func extBytes(typ byte, body []byte) []byte {
+	return append([]byte{0xc7, byte(len(body)), typ}, body...)
+}
+
+// TestDecodeValueHandlesExt79SaltConstant covers ext type 79, whose body is
+// itself msgpack: a (name, value) 2-tuple built by Salt's own
+// salt.utils.msgpack.dumps((obj.name, obj.value), use_bin_type=True) (see
+// salt/payload.py). The two well-formed byte sequences below were produced
+// by Salt 3006.27's real encoder, not by anything on our side of the wire —
+// the whole point of this test is that our previous assumption (the ext
+// body is raw UTF-8 text) was wrong.
+func TestDecodeValueHandlesExt79SaltConstant(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		body []byte
+		want string
+	}{
+		{
+			// _Constant("MISSING", None): fixarray(2), fixstr(7) "MISSING", nil.
+			name: "nil value renders as bare name",
+			body: []byte{0x92, 0xa7, 'M', 'I', 'S', 'S', 'I', 'N', 'G', 0xc0},
+			want: "MISSING",
+		},
+		{
+			// _Constant("NOT_SET", 42): fixarray(2), fixstr(7) "NOT_SET", fixint 42.
+			name: "integer value renders as name=value",
+			body: []byte{0x92, 0xa7, 'N', 'O', 'T', '_', 'S', 'E', 'T', 0x2a},
+			want: "NOT_SET=42",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			payload := pack(t, map[string]any{
+				"const": msgpack.RawMessage(extBytes(79, tc.body)),
+			})
+
+			got, err := saltipc.DecodeValue(payload)
+			if err != nil {
+				t.Fatalf("DecodeValue: %v", err)
+			}
+
+			m, ok := got.(map[any]any)
+			if !ok {
+				t.Fatalf("DecodeValue returned %T, want map[any]any", got)
+			}
+
+			if m["const"] != tc.want {
+				t.Errorf("const = %v, want %q", m["const"], tc.want)
+			}
+		})
+	}
+}
+
+// TestDecodeValueToleratesMalformedExt79 covers ext-79 bodies that aren't a
+// well-formed (name, value) tuple. Never panic on bus data: a malformed
+// field must degrade to a readable placeholder and must not fail the whole
+// decode.
+func TestDecodeValueToleratesMalformedExt79(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		body []byte
+	}{
+		{"not an array", []byte{0x2a}},           // fixint 42
+		{"wrong arity", []byte{0x91, 0xa1, 'x'}}, // fixarray(1), "x"
+		{"undecodable", []byte{0xc1}},            // reserved/never-used code
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			payload := pack(t, map[string]any{
+				"const": msgpack.RawMessage(extBytes(79, tc.body)),
+			})
+
+			got, err := saltipc.DecodeValue(payload)
+			if err != nil {
+				t.Fatalf("DecodeValue returned error, want graceful degradation: %v", err)
+			}
+
+			m, ok := got.(map[any]any)
+			if !ok {
+				t.Fatalf("DecodeValue returned %T, want map[any]any", got)
+			}
+
+			s, ok := m["const"].(string)
+			if !ok || s == "" {
+				t.Errorf("const = %#v, want a non-empty placeholder string", m["const"])
+			}
+		})
+	}
+}
+
 func TestExtractFieldsSurvivesTypeMismatchOnEarlierField(t *testing.T) {
 	t.Parallel()
 

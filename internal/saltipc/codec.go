@@ -279,8 +279,58 @@ func init() {
 				return fmt.Errorf("read ext 79: %w", err)
 			}
 
-			v.SetString(string(b))
+			v.SetString(decodeConstant(b))
 
 			return nil
 		})
+}
+
+// decodeConstant renders ext type 79's body for display. Per salt/payload.py,
+// a Salt constant is encoded as
+//
+//	salt.utils.msgpack.dumps((obj.name, obj.value), use_bin_type=True)
+//
+// i.e. the ext body is itself msgpack: a 2-element array of (name, value),
+// not raw text. It renders as "name" when value is nil (the common case, e.g.
+// _Constant("MISSING", None)) and "name=value" otherwise, collapsing the pair
+// into the single readable string DecodeValue's callers already expect.
+//
+// This runs while decoding an operator-requested payload (spec §4.2), so a
+// malformed body must degrade to a readable placeholder, never panic and
+// never fail the whole decode: an unparseable ext-79 field should cost that
+// one field, not the rest of the event.
+func decodeConstant(b []byte) string {
+	dec := msgpack.NewDecoder(bytes.NewReader(b))
+
+	v, err := dec.DecodeInterface()
+	if err != nil {
+		return fmt.Sprintf("<salt-constant: undecodable: %v>", err)
+	}
+
+	tuple, ok := v.([]interface{})
+	if !ok || len(tuple) != 2 {
+		return fmt.Sprintf("<salt-constant: unexpected shape %v>", v)
+	}
+
+	name, ok := tuple[0].(string)
+	if !ok {
+		return fmt.Sprintf("<salt-constant: non-string name %v>", tuple[0])
+	}
+
+	if tuple[1] == nil {
+		return name
+	}
+
+	return name + "=" + formatConstantValue(tuple[1])
+}
+
+// formatConstantValue stringifies a constant's value field. Bin-typed values
+// (Python bytes) decode to []byte, which %v would render as an unreadable
+// slice of integers, so those are converted to string like any other scalar.
+func formatConstantValue(v any) string {
+	if b, ok := v.([]byte); ok {
+		return string(b)
+	}
+
+	return fmt.Sprintf("%v", v)
 }
