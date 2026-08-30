@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"math"
 	"reflect"
 	"strconv"
 	"time"
@@ -86,47 +87,118 @@ func ExtractFields(payload []byte) Fields {
 }
 
 // extractOne reads or skips the value for one key.
+//
+// Every indexed scalar field is read via DecodeInterface plus a type
+// assertion/switch, never via a type-specific Decode* call (DecodeString,
+// DecodeInt64, DecodeBool) with a Skip() or bare discard as the mismatch
+// fallback. Those typed calls read the value's type-code byte first and only
+// then discover it doesn't match, so by the time a fallback runs, the code
+// byte is already consumed and Skip() (or simply moving on) resumes one byte
+// into the middle of the value rather than at a value boundary. That desyncs
+// the map cursor for the rest of the payload, and because Go map iteration
+// order is randomised, an unrelated, perfectly well-formed field encountered
+// afterwards is silently dropped too. DecodeInterface decodes whatever value
+// is actually present and always consumes it in full, so a field encoded as
+// an unexpected type costs exactly that one field and leaves the cursor at
+// the next value's boundary. Do not reinstate the typed-decode-then-Skip
+// shape here.
 func extractOne(dec *msgpack.Decoder, key string, f *Fields) error {
 	switch key {
 	case "id":
-		f.ID, _ = dec.DecodeString()
+		f.ID = decodeStringField(dec)
 	case "jid":
 		f.JID = decodeJID(dec)
 	case "fun":
-		f.Fun, _ = dec.DecodeString()
+		f.Fun = decodeStringField(dec)
 	case "retcode":
-		v, err := dec.DecodeInt64()
-		if err != nil {
-			return dec.Skip()
+		if v, ok := decodeIntField(dec); ok {
+			f.RetCode = v
 		}
-
-		f.RetCode = int(v)
 	case "success":
-		v, err := dec.DecodeBool()
-		if err != nil {
-			return dec.Skip()
+		if v, ok := decodeBoolField(dec); ok {
+			f.Success, f.HasSuccess = v, true
 		}
-
-		f.Success, f.HasSuccess = v, true
 	case "return":
 		f.HasRet = true
 
 		return dec.Skip()
 	case "_stamp":
-		s, err := dec.DecodeString()
-		if err != nil {
-			// Unreadable _stamp is tolerated, not fatal: the field is just left zero.
-			return nil //nolint:nilerr // intentional: a bad _stamp doesn't abort the whole extraction
-		}
-
-		if t, err := time.Parse(stampLayout, s); err == nil {
-			f.Stamp = t.UTC()
+		if s := decodeStringField(dec); s != "" {
+			if t, err := time.Parse(stampLayout, s); err == nil {
+				f.Stamp = t.UTC()
+			}
 		}
 	default:
 		return dec.Skip()
 	}
 
 	return nil
+}
+
+// decodeStringField reads exactly one value and returns it as a string, or ""
+// if it decoded to something else entirely (including a decode error).
+func decodeStringField(dec *msgpack.Decoder) string {
+	v, err := dec.DecodeInterface()
+	if err != nil {
+		return ""
+	}
+
+	s, _ := v.(string)
+
+	return s
+}
+
+// decodeBoolField reads exactly one value and reports whether it was a bool.
+func decodeBoolField(dec *msgpack.Decoder) (bool, bool) {
+	v, err := dec.DecodeInterface()
+	if err != nil {
+		return false, false
+	}
+
+	b, ok := v.(bool)
+
+	return b, ok
+}
+
+// decodeIntField reads exactly one value and reports whether it was some
+// integer type. DecodeInterface does not normalise integers to a single Go
+// type (spec: fixnum decodes to int8, larger values to the narrowest of
+// int16/int32/int64/uint8/uint16/uint32/uint64 that fits the wire encoding),
+// so every integer kind it can produce must be handled explicitly.
+func decodeIntField(dec *msgpack.Decoder) (int, bool) {
+	v, err := dec.DecodeInterface()
+	if err != nil {
+		return 0, false
+	}
+
+	switch t := v.(type) {
+	case int8:
+		return int(t), true
+	case int16:
+		return int(t), true
+	case int32:
+		return int(t), true
+	case int64:
+		return int(t), true
+	case uint8:
+		return int(t), true
+	case uint16:
+		return int(t), true
+	case uint32:
+		return int(t), true
+	case uint64:
+		// Bounds-checked: a uint64 above math.MaxInt64 would silently wrap
+		// when narrowed to int (gosec G115). retcode never legitimately
+		// reaches that range; treat it as an unreadable field instead of
+		// risking a corrupted value.
+		if t > math.MaxInt64 {
+			return 0, false
+		}
+
+		return int(t), true
+	default:
+		return 0, false
+	}
 }
 
 // decodeJID normalises a JID that may arrive as a string or an integer.

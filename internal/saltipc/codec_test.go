@@ -1,6 +1,7 @@
 package saltipc_test
 
 import (
+	"bytes"
 	"testing"
 	"time"
 
@@ -114,6 +115,41 @@ func TestDecodeValueHandlesSaltExtTypes(t *testing.T) {
 
 	if _, err := saltipc.DecodeValue(ext78); err != nil {
 		t.Errorf("DecodeValue on ext 78 returned error: %v", err)
+	}
+}
+
+func TestExtractFieldsSurvivesTypeMismatchOnEarlierField(t *testing.T) {
+	t.Parallel()
+
+	// retcode arrives as a string (a type mismatch), immediately followed by
+	// a well-formed fun. A typed-decode-then-Skip fallback for retcode (e.g.
+	// dec.DecodeInt64() failing, then dec.Skip()) would consume retcode's
+	// type-code byte before discovering the mismatch, then Skip() from one
+	// byte into the value — desyncing the map cursor so the perfectly
+	// well-formed fun that follows is silently lost too.
+	//
+	// Key order is pinned explicitly via the Encoder, rather than built from
+	// a Go map (whose iteration order — and therefore wire order, since
+	// msgpack.Marshal does not sort map keys by default — is randomised), so
+	// the trigger is deterministic regardless of run.
+	var buf bytes.Buffer
+
+	enc := msgpack.NewEncoder(&buf)
+	if err := enc.EncodeMapLen(2); err != nil {
+		t.Fatalf("EncodeMapLen: %v", err)
+	}
+
+	for _, kv := range []string{"retcode", "hello", "fun", "state.apply"} {
+		if err := enc.EncodeString(kv); err != nil {
+			t.Fatalf("EncodeString(%q): %v", kv, err)
+		}
+	}
+
+	got := saltipc.ExtractFields(buf.Bytes())
+
+	if got.Fun != "state.apply" {
+		t.Errorf("Fun = %q, want state.apply (a type-mismatched retcode must not corrupt fields decoded after it)",
+			got.Fun)
 	}
 }
 
