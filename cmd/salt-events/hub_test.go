@@ -982,9 +982,15 @@ func snapshotAllocBytes(tb testing.TB, h *hub, jobs int) uint64 {
 //
 // The assertion is on the SHAPE (flat in minion count), not on a byte budget,
 // so it fails on a return to O(job size) without failing on an extra row field.
+//
+// This test and its subtests must NOT call t.Parallel(), and that is not an
+// oversight to be tidied away. runtime.ReadMemStats reports TotalAlloc for the
+// whole PROCESS, so anything else allocating during the measured window lands
+// in the delta. With the subtests parallel, each one's allocations polluted the
+// other's measurement and the test failed roughly four runs in five — while
+// still passing often enough to look merely flaky. Running it serially makes
+// the measurement deterministic: 5/5 green at -parallel 1.
 func TestTheSnapshotJobListDoesNotScaleWithMinionCount(t *testing.T) {
-	t.Parallel()
-
 	const (
 		lean = 10
 		fat  = 1000
@@ -997,8 +1003,6 @@ func TestTheSnapshotJobListDoesNotScaleWithMinionCount(t *testing.T) {
 
 	for name, jobs := range loads {
 		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-
 			small := snapshotAllocBytes(t, jobsHub(t, jobs, lean), jobs)
 			large := snapshotAllocBytes(t, jobsHub(t, jobs, fat), jobs)
 
