@@ -13,6 +13,7 @@ import (
 
 	"github.com/TKC-Labs/go-salt-events/internal/model"
 	"github.com/TKC-Labs/go-salt-events/internal/saltipc"
+	"github.com/TKC-Labs/go-salt-events/internal/stats"
 )
 
 // pubSocket is the only basename this program may ever open (invariant 1).
@@ -25,12 +26,19 @@ const pullSocket = "master_event_pull.ipc"
 // recordSink collects everything the reader emits and signals once a wanted
 // number of events has arrived, so tests can stop the reader deterministically
 // instead of sleeping.
+// gapWindow is one Gap call. Both ends are kept because one outage now
+// produces many calls that share a from, so a test can tell "one outage
+// reported repeatedly" from "several outages".
+type gapWindow struct {
+	from, to time.Time
+}
+
 type recordSink struct {
 	want int
 
 	mu     sync.Mutex
 	events []model.Event
-	gaps   []time.Duration
+	gaps   []gapWindow
 	errs   int
 
 	reachedOnce sync.Once
@@ -56,7 +64,7 @@ func (s *recordSink) Gap(from, to time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.gaps = append(s.gaps, to.Sub(from))
+	s.gaps = append(s.gaps, gapWindow{from: from, to: to})
 }
 
 func (s *recordSink) DecodeError(error) {
@@ -66,17 +74,29 @@ func (s *recordSink) DecodeError(error) {
 	s.errs++
 }
 
-func (s *recordSink) snapshot() ([]model.Event, []time.Duration, int) {
+func (s *recordSink) snapshot() ([]model.Event, []gapWindow, int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	out := make([]model.Event, len(s.events))
 	copy(out, s.events)
 
-	gaps := make([]time.Duration, len(s.gaps))
+	gaps := make([]gapWindow, len(s.gaps))
 	copy(gaps, s.gaps)
 
 	return out, gaps, s.errs
+}
+
+// outages counts distinct gap windows by their start, which is how a sink that
+// wants "how many times did we lose the bus" gets it now that one outage is
+// reported repeatedly while it runs.
+func outages(gaps []gapWindow) int {
+	seen := make(map[time.Time]struct{}, len(gaps))
+	for _, g := range gaps {
+		seen[g.from] = struct{}{}
+	}
+
+	return len(seen)
 }
 
 // busServer stands in for salt-master's IPCMessagePublisher.
@@ -572,12 +592,193 @@ func TestReaderReportsAGapAcrossAReconnect(t *testing.T) {
 		t.Fatalf("got %d events, want 2 — the reader must reconnect after the master closes", len(events))
 	}
 
-	if len(gaps) != 1 {
-		t.Fatalf("got %d gaps, want exactly 1 for one disconnect/reconnect cycle", len(gaps))
+	if len(gaps) == 0 {
+		t.Fatal("no gap reported for a disconnect/reconnect cycle")
 	}
 
-	if gaps[0] < 0 {
-		t.Errorf("gap duration = %v, must not be negative", gaps[0])
+	// One outage is reported many times as it runs — that is the point, the
+	// panes must not read a flat zero in the meantime — but it is still one
+	// outage: every report carries the same start, so a sink that counts
+	// distinct starts counts disconnections rather than retries.
+	//
+	// The bound is two because this master serves two connections and then
+	// stops listening: the outage between them, which the reconnect closed, and
+	// the trailing one after the second connection, which was still in progress
+	// when the test cancelled. Anything above that would mean retries were
+	// being counted as fresh outages.
+	if n := outages(gaps); n < 1 || n > 2 {
+		t.Errorf("got %d distinct outages from %d gap reports, want 1 or 2 — "+
+			"repeated reports of one outage must share a start", n, len(gaps))
+	}
+
+	for i, g := range gaps {
+		if g.to.Before(g.from) {
+			t.Errorf("gap %d = %v, must not be negative", i, g.to.Sub(g.from))
+		}
+	}
+}
+
+// outageSpan is how far the test clock jumps once the master is gone. It only
+// has to cross a one-second bucket boundary; three seconds leaves room for the
+// gap to be visible in the seconds ring without being near its 120-bucket edge.
+const outageSpan = 3 * time.Second
+
+// testClock is a stats.Clock the test drives by hand, shared with the reader so
+// arrival stamping, gap reporting and bucket expiry all read the same logical
+// time. It is mutex-guarded because the reader goroutine reads it while the
+// test advances it.
+type testClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func (c *testClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.t
+}
+
+func (c *testClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.t = c.t.Add(d)
+}
+
+// ringSink is the Sink the rate panes actually get: it feeds a real
+// stats.Rings, so the assertions are about what the operator would see rather
+// than about which methods the reader happened to call.
+//
+// It serialises ring access the way the hub does — the reader writes under the
+// lock, the test reads a snapshot under the same lock.
+type ringSink struct {
+	mu    sync.Mutex
+	rings *stats.Rings
+
+	// gapAfter is the instant a reported gap must reach before it counts as
+	// evidence. A gap emitted before the test advanced the clock says nothing
+	// about the outage that follows it.
+	gapAfter time.Time
+
+	gappedOnce sync.Once
+	gapped     chan struct{}
+
+	firstOnce sync.Once
+	first     chan struct{}
+}
+
+func newRingSink(rings *stats.Rings, gapAfter time.Time) *ringSink {
+	return &ringSink{
+		rings:    rings,
+		gapAfter: gapAfter,
+		gapped:   make(chan struct{}),
+		first:    make(chan struct{}),
+	}
+}
+
+func (s *ringSink) Event(e model.Event) {
+	s.mu.Lock()
+	s.rings.Add(e.Arrival)
+	s.mu.Unlock()
+
+	s.firstOnce.Do(func() { close(s.first) })
+}
+
+func (s *ringSink) Gap(from, to time.Time) {
+	s.mu.Lock()
+	s.rings.MarkGap(from, to)
+	s.mu.Unlock()
+
+	if !to.Before(s.gapAfter) {
+		s.gappedOnce.Do(func() { close(s.gapped) })
+	}
+}
+
+func (s *ringSink) DecodeError(error) {}
+
+func (s *ringSink) summarySeconds() (stats.Summary, stats.Bucket) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	secs := s.rings.Seconds()
+
+	return s.rings.SummarySeconds(), secs[len(secs)-1]
+}
+
+// TestReaderReportsAGapWhileTheOutageIsStillInProgress is the live half of spec
+// §8.2, and the half that matters during an incident.
+//
+// Reporting the gap only once reconnection succeeds repairs the history
+// retroactively but leaves the Rate pane saying "0 events/sec" for the entire
+// duration of the outage — the exact inversion §8.2 names, since a master that
+// is quiet and a bus we have lost are opposite facts. So the gap is re-reported
+// after every failed retry, and here the master never comes back at all: the
+// listener closed after one connection, so there is no reconnect to repair
+// anything and the rings must already be showing the truth.
+func TestReaderReportsAGapWhileTheOutageIsStillInProgress(t *testing.T) {
+	t.Parallel()
+
+	srv := newBusServer(t, pubSocket)
+	srv.serve(frame(t, "salt/auth", map[string]any{"act": "accept"}), 1, 0)
+
+	start := time.Date(2026, 8, 30, 8, 14, 0, 0, time.UTC)
+	clk := &testClock{t: start}
+	rings := stats.NewRings(clk)
+	sink := newRingSink(rings, start.Add(outageSpan))
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+
+	go func() { done <- saltipc.NewReader(srv.dir, clk.Now).Run(ctx, sink) }()
+
+	select {
+	case <-sink.first:
+	case err := <-done:
+		t.Fatalf("Run returned %v before delivering the first event", err)
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for the first event")
+	}
+
+	// The master is now gone for good: serve accepted its one connection and
+	// closed the listener, which unlinks the socket, so every dial from here on
+	// fails. Move the clock past a bucket boundary so the outage is a window
+	// the seconds ring can actually show.
+	clk.Advance(outageSpan)
+
+	select {
+	case <-sink.gapped:
+	case err := <-done:
+		t.Fatalf("Run returned %v without reporting the outage in progress", err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("no gap reported while the outage was still in progress: " +
+			"the reader waits for a successful reconnect, so the Rate pane " +
+			"reads 0 events/sec for the whole outage (spec §8.2)")
+	}
+
+	cancel()
+
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	summary, newest := sink.summarySeconds()
+
+	if !newest.Gap {
+		t.Errorf("newest second bucket = %+v, want Gap; a bucket with Count 0 and "+
+			"Gap false renders as a flat line at zero, which is a quiet master, "+
+			"not a lost bus", newest)
+	}
+
+	if !summary.NowIsGap {
+		t.Error("SummarySeconds().NowIsGap = false during an in-progress outage; " +
+			"the Rate pane would print Now as a genuine 0")
+	}
+
+	if summary.Now != 0 {
+		t.Errorf("SummarySeconds().Now = %v while gapped, want the zero value", summary.Now)
 	}
 }
 

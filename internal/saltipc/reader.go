@@ -28,6 +28,16 @@ type Sink interface {
 	// render this differently from zero: a disconnection that draws as a flat
 	// line at zero is indistinguishable from a quiet master, which is exactly
 	// backwards during an incident (spec §8.2).
+	//
+	// One outage produces MANY calls, not one. The window is re-reported while
+	// the outage is still running, each time with the same from and a later to,
+	// because a gap announced only on reconnect leaves the panes reading "0
+	// events/sec" for the whole outage — the inversion §8.2 exists to prevent.
+	// Implementations must therefore be idempotent over a repeated window;
+	// stats.Rings.MarkGap is, since it sets flags on empty buckets rather than
+	// accumulating. A sink that wants to count distinct outages counts distinct
+	// from values: from is stable for the life of one outage and only changes
+	// when the next one begins.
 	Gap(from, to time.Time)
 
 	// DecodeError reports a frame we could not read. Counted and surfaced,
@@ -46,6 +56,17 @@ const (
 	minBackoff = 250 * time.Millisecond
 	maxBackoff = 5 * time.Second
 )
+
+// gapRefresh is how often an in-progress outage is re-reported while we wait to
+// retry.
+//
+// A single report per retry is not enough at the far end of the backoff: the
+// rate rings expire buckets by wall clock, so buckets opened after the last
+// report are empty and unflagged, and at the 5s maximum backoff the newest
+// seconds bucket — the one the Rate pane prints as "now" — would read a flat
+// zero again for most of every wait. One report per bucket width keeps the head
+// of the ring truthful for the whole outage.
+const gapRefresh = time.Second
 
 // Reader owns the publish socket for the process lifetime.
 //
@@ -124,7 +145,13 @@ func (r *Reader) Run(ctx context.Context, sink Sink) error {
 				return err
 			}
 
-			if !sleep(ctx, backoff) {
+			// The outage is happening NOW. Reporting it only once the
+			// reconnect succeeds repairs the history retroactively but leaves
+			// the Rate pane saying "0 events/sec — the master is quiet" for the
+			// entire time we are actually blind, which is the inversion spec
+			// §8.2 exists to prevent. Re-reporting from the same lostAt keeps it
+			// one contiguous window; MarkGap absorbs the repetition.
+			if !r.waitToRetry(ctx, backoff, lostAt, sink) {
 				return nil
 			}
 
@@ -134,6 +161,8 @@ func (r *Reader) Run(ctx context.Context, sink Sink) error {
 		}
 
 		if connected {
+			// Closes the window at the instant it actually ended, which the
+			// reports made during the wait could only approximate.
 			sink.Gap(lostAt, r.now())
 		}
 
@@ -189,6 +218,28 @@ func resolveSymlinks(path string) (string, bool) {
 	}
 
 	return resolved, true
+}
+
+// waitToRetry waits for d before the next dial, keeping the outage reported as
+// it runs. It reports false if ctx was cancelled first.
+//
+// The wait is broken into gapRefresh slices so the window stays current rather
+// than being announced once and going stale. Cost per report is bounded by the
+// ring size, not by the outage length: MarkGap clamps its walk to the visible
+// window, so an outage of hours costs the same per report as one of seconds,
+// and repeating the same window only re-sets flags.
+func (r *Reader) waitToRetry(ctx context.Context, d time.Duration, lostAt time.Time, sink Sink) bool {
+	for remaining := d; ; remaining -= gapRefresh {
+		sink.Gap(lostAt, r.now())
+
+		if remaining <= 0 {
+			return true
+		}
+
+		if !sleep(ctx, min(remaining, gapRefresh)) {
+			return false
+		}
+	}
 }
 
 // sleep waits for d, reporting false if ctx was cancelled first.
