@@ -1,0 +1,80 @@
+# nfpm builds the .deb and .rpm from one description, with no dpkg or rpmbuild
+# toolchain on the runner. See `just package`.
+#
+# VERSION and ARCH are supplied by the environment so one config serves every
+# architecture; nfpm expands ${VAR} itself.
+name: salt-events
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+section: admin
+priority: optional
+maintainer: TKC-Labs <chris.row@discursive.org>
+description: |
+  Read-only terminal console for the Salt master event bus.
+
+  Runs on a Salt master, caches the session's events in memory, and makes them
+  searchable, filterable and summarisable, with a live view of bus load.
+
+  Subscribes to master_event_pub.ipc only — the pull socket, which could inject
+  events onto the bus, is never opened. Requires root, because the publish
+  socket is mode 0600 and owned by root: run it with sudo.
+vendor: TKC-Labs
+homepage: https://git.tkclabs.io/TKC-Labs/go-salt-events
+license: MIT
+
+# Deliberately NO dependency on salt-master. The tool runs on a master, but
+# declaring that would make it uninstallable on a jump host where someone only
+# wants --help or to inspect an exported NDJSON file. The requirement is in the
+# description instead.
+#
+# Deliberately NO systemd unit: this is an interactive TUI, not a service.
+#
+# Deliberately NO setuid bit and no file capabilities. It needs root because
+# master_event_pub.ipc is 0600 root:root, and the answer to that is sudo. A
+# setuid binary reading a socket that carries every minion's returns would be a
+# privilege-escalation surface for no benefit. Do not add one.
+#
+# Deliberately NO config file under /etc. Configuration is optional and lives
+# per-user at ~/.config/salt-events/config.toml; shipping a system default would
+# create a file the tool does not need and packaging would then own on upgrade.
+
+# The binary is staged to a FIXED path by `just package` before each nfpm run,
+# rather than referenced as dist/salt-events-linux-${ARCH}/. nfpm expands
+# environment variables in metadata fields (name, arch, version) but NOT in
+# contents.src, so an ${ARCH} here fails with "no matching files" — and it fails
+# at packaging time, after a successful build, which reads as a build problem.
+contents:
+  - src: ./dist/pkgroot/salt-events
+    dst: /usr/bin/salt-events
+    file_info:
+      mode: 0755
+
+  - src: ./README.md
+    dst: /usr/share/doc/salt-events/README.md
+    file_info:
+      mode: 0644
+
+  - src: ./docs/running.md
+    dst: /usr/share/doc/salt-events/running.md
+    file_info:
+      mode: 0644
+
+  - src: ./LICENSE
+    dst: /usr/share/licenses/salt-events/LICENSE
+    packager: rpm
+    file_info:
+      mode: 0644
+
+  - src: ./LICENSE
+    dst: /usr/share/doc/salt-events/LICENSE
+    packager: deb
+    file_info:
+      mode: 0644
+
+rpm:
+  group: Applications/System
+
+deb:
+  fields:
+    Bugs: https://git.tkclabs.io/TKC-Labs/go-salt-events/issues

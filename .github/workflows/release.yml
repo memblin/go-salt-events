@@ -1,0 +1,172 @@
+name: Release
+
+# Tag-triggered. A release is published only for an annotated or lightweight
+# v* tag, never on a branch push -- there is no such thing as an accidental
+# release from a merge.
+on:
+  push:
+    tags:
+      - 'v*'
+
+# The release job needs to create a release and upload assets.
+permissions:
+  contents: write
+
+# Deliberately NO cancel-in-progress. Superseding a half-finished release run
+# is how a release ends up with three of its five artefacts attached. Two tags
+# pushed close together should both publish, slowly.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # The same gates CI runs on a PR, re-run against the tagged commit.
+  #
+  # This is not redundant with the PR run. A tag can point at any commit,
+  # including one that never went through a PR, and `git tag` on the wrong SHA
+  # is an ordinary human error. Publishing an artefact built from a commit whose
+  # tests never ran is the failure this exists to prevent.
+  verify:
+    name: verify · vet · lint · test
+    runs-on: [alma10, vm]
+    timeout-minutes: 30
+    # completed is set ONLY by the final step. A job killed part-way through --
+    # OOM, cancellation, runner eviction -- never sets it. See the release job's
+    # gate, and the long note in ci.yml.
+    outputs:
+      completed: ${{ steps.done.outputs.completed }}
+    env:
+      # The race detector requires cgo; the runners default CGO_ENABLED=0.
+      CGO_ENABLED: 1
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          # Tags and full history: `just build-release` derives the build date
+          # from the commit timestamp, and a shallow clone has neither.
+          fetch-depth: 0
+
+      - name: Resolve golangci-lint version
+        id: lint-version
+        run: |
+          version="$(go list -m -f '{{.Version}}' github.com/golangci/golangci-lint/v2)"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Install golangci-lint (prebuilt)
+        env:
+          GOLANGCI_LINT_VERSION: ${{ steps.lint-version.outputs.version }}
+        run: |
+          curl -sSfL "https://raw.githubusercontent.com/golangci/golangci-lint/${GOLANGCI_LINT_VERSION}/install.sh" \
+            | sh -s -- -b "${HOME}/.local/bin" "${GOLANGCI_LINT_VERSION}"
+          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+
+      - name: Vet
+        run: just vet
+
+      - name: Lint
+        run: |
+          golangci-lint cache clean
+          golangci-lint run
+
+      - name: Format check
+        run: golangci-lint fmt --diff
+
+      - name: Tidy check
+        run: just tidy
+
+      - name: Test
+        run: just test-ci
+
+      - name: Mark job completed
+        id: done
+        run: echo "completed=true" >> "$GITHUB_OUTPUT"
+
+  release:
+    name: build · package · publish
+    runs-on: [alma10, vm]
+    timeout-minutes: 30
+    needs: [verify]
+    # always(), so the gate below runs and can report WHY it refused rather than
+    # the job being silently skipped with no explanation in the log.
+    if: always()
+    steps:
+      - name: Gate on verify
+        env:
+          VERIFY_RESULT: ${{ needs.verify.result }}
+          VERIFY_COMPLETED: ${{ needs.verify.outputs.completed }}
+        run: |
+          # Same two-condition guard as ci.yml's check job, and for the same
+          # reason: this Gitea version has reported a job killed mid-run as
+          # conclusion=success. Here the stakes are higher than a green tick --
+          # a bypassed gate publishes an artefact people install as root on a
+          # production master.
+          fail=0
+          if [[ "${VERIFY_RESULT}" != "success" ]]; then
+            echo "::error::verify did not succeed (result='${VERIFY_RESULT}'); refusing to publish."
+            fail=1
+          fi
+          if [[ "${VERIFY_COMPLETED}" != "true" ]]; then
+            echo "::error::verify did not run to completion (completed='${VERIFY_COMPLETED}'); it was killed or cancelled part-way, most likely OOM. Refusing to publish artefacts from an unverified commit."
+            fail=1
+          fi
+          if [[ "${fail}" -ne 0 ]]; then
+            exit 1
+          fi
+
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Derive version from the tag
+        id: version
+        env:
+          GH_REF_NAME: ${{ github.ref_name }}
+        run: |
+          # ref_name is the tag (e.g. v0.1.0). The binary and the packages must
+          # agree, so both read this one value: `just package` passes VERSION to
+          # the linker and to nfpm.
+          #
+          # rpm and deb both reject a leading 'v' in a version field, so strip it
+          # for packaging while the binary keeps the tag verbatim.
+          echo "tag=${GH_REF_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "bare=${GH_REF_NAME#v}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build and package
+        env:
+          VERSION: ${{ steps.version.outputs.bare }}
+        run: just package
+
+      - name: List artefacts
+        run: ls -l dist/ && cat dist/sha256sums.txt
+
+      # Fail here, with a sentence saying what to install, rather than at the
+      # publish step with "tea: command not found" after a successful build.
+      - name: Check for tea
+        run: |
+          if ! command -v tea >/dev/null 2>&1; then
+            echo "::error::tea is not installed on this runner. Install it (https://gitea.com/gitea/tea) or switch the publish step to the releases API."
+            exit 1
+          fi
+          tea --version
+
+      - name: Publish release
+        env:
+          # tea reads the token from the environment; GITEA_TOKEN is a repo
+          # secret, not the ephemeral job token, because the job token cannot
+          # always create releases on self-hosted Gitea.
+          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          assets=()
+          for f in dist/*.tar.gz dist/*.deb dist/*.rpm dist/sha256sums.txt; do
+            assets+=(--asset "${f}")
+          done
+
+          tea release create \
+            --repo "${REPO}" \
+            --tag "${TAG}" \
+            --title "${TAG}" \
+            --note "See CHANGELOG or the commit log for changes in ${TAG}." \
+            "${assets[@]}"

@@ -30,6 +30,50 @@ connected · 41203 events · cache 118M/256M · shed 0 drop 0    theme gruvbox-d
 sudo salt-events
 ```
 
+## Install
+
+Packages are attached to each [release](https://git.tkclabs.io/TKC-Labs/go-salt-events/releases),
+for `linux/amd64` and `linux/arm64`. The binaries are statically linked, so they
+carry no glibc dependency and a package built on one host installs on another.
+
+```bash
+# RPM (AlmaLinux, Rocky, RHEL, Fedora)
+sudo dnf install ./salt-events-<version>.x86_64.rpm
+
+# DEB (Debian, Ubuntu)
+sudo apt install ./salt-events_<version>_amd64.deb
+
+# Or just the binary
+tar xzf salt-events_<version>_linux_amd64.tar.gz
+sudo install -m 0755 salt-events /usr/local/bin/
+```
+
+Verify what you downloaded against `sha256sums.txt` from the same release:
+
+```bash
+sha256sum -c sha256sums.txt
+```
+
+The packages deliberately do **not** depend on `salt-master`. The tool runs on a
+master, but declaring that dependency would make it uninstallable on a jump host
+where you only want to read an exported NDJSON file. They also install no
+systemd unit — this is an interactive console, not a service — and set no setuid
+bit: it needs root because the publish socket is `0600 root:root`, and the
+answer to that is `sudo`.
+
+To build from source instead:
+
+```bash
+just build          # ./salt-events, version derived from git describe
+just package        # every release artefact into dist/
+```
+
+Check which build you are holding with:
+
+```bash
+salt-events --version
+```
+
 Running without it is not a mystery: the console starts, the reader fails on
 its first connect, and the pane is replaced by the reason and the fix rather
 than by a bare `permission denied`.

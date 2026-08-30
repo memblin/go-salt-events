@@ -43,8 +43,60 @@ tidy:
 
 check: fmt-check vet lint test
 
+# Version stamped into the binary. Defaults to the closest tag plus the commit,
+# so a local build reports something truthful rather than "dev"; the release
+# workflow overrides it with the tag being built.
+VERSION := env_var_or_default("VERSION", `git describe --tags --always --dirty 2>/dev/null || echo dev`)
+COMMIT := `git rev-parse --short HEAD 2>/dev/null || echo unknown`
+LDFLAGS := "-X main.version=" + VERSION + " -X main.commit=" + COMMIT
+
 build:
-    go build -o salt-events ./cmd/salt-events
+    go build -ldflags "{{LDFLAGS}}" -o salt-events ./cmd/salt-events
+
+# A release binary: static (no glibc coupling when a package built on one host
+# is installed on another), stripped, and with local paths trimmed out.
+# SOURCE_DATE_EPOCH keeps the stamped date reproducible for a given commit.
+build-release goos="linux" goarch="amd64":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    date=$(date -u -d "@${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct)}" +%Y-%m-%dT%H:%M:%SZ)
+    mkdir -p dist
+    CGO_ENABLED=0 GOOS={{goos}} GOARCH={{goarch}} go build \
+        -trimpath \
+        -ldflags "-s -w {{LDFLAGS}} -X main.buildDate=${date}" \
+        -o dist/salt-events-{{goos}}-{{goarch}}/salt-events \
+        ./cmd/salt-events
+
+# Build every artefact for a release: binaries, tarballs, .deb, .rpm, checksums.
+package: (build-release "linux" "amd64") (build-release "linux" "arm64")
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd dist
+    for arch in amd64 arm64; do
+        d="salt-events-linux-${arch}"
+        install -m 0644 ../README.md ../LICENSE "${d}/"
+        install -m 0644 ../docs/running.md "${d}/running.md"
+        tar -czf "salt-events_{{VERSION}}_linux_${arch}.tar.gz" -C "${d}" .
+    done
+    cd ..
+    # nfpm.yaml points at a fixed staging path, so each architecture is copied
+    # into place in turn (see the note in nfpm.yaml).
+    mkdir -p dist/pkgroot
+    for arch in amd64 arm64; do
+        install -m 0755 "dist/salt-events-linux-${arch}/salt-events" dist/pkgroot/salt-events
+        for pkg in deb rpm; do
+            VERSION="{{VERSION}}" ARCH="${arch}" \
+                go tool nfpm package --config nfpm.yaml --packager "${pkg}" --target dist/
+        done
+    done
+    rm -rf dist/pkgroot
+    # sha256sum runs from inside dist/ so the file records bare names rather
+    # than dist/-prefixed paths, which is what `sha256sum -c` expects after a
+    # release asset is downloaded next to it.
+    cd dist
+    sha256sum *.tar.gz *.deb *.rpm > sha256sums.txt
+    echo "artefacts in dist/:"
+    ls -1
 
 # Record real frames off the live bus into testdata (spec §13). Needs sudo.
 capture n="200":

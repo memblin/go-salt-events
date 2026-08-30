@@ -55,6 +55,13 @@ func main() {
 }
 
 func run() error {
+	// Answered before anything can fail: a version query must work on a host
+	// with no socket, no config and no Salt at all, because that is exactly
+	// when someone asks which binary they are holding.
+	if splitVersionArg(os.Args[1:]) {
+		return printVersion(os.Stdout)
+	}
+
 	capture, args, err := splitCaptureArgs(os.Args[1:])
 	if err != nil {
 		return err
