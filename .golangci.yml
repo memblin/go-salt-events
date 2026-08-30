@@ -41,6 +41,20 @@ linters:
           msg: "colour literals belong in internal/theme only (spec §3.2)"
         - pattern: 'lipgloss\.AdaptiveColor\('
           msg: "colour literals belong in internal/theme only (spec §3.2)"
+        # SECONDARY check, deliberately labelled as such. The rule that
+        # actually closes the hole is an API one: theme.compile is unexported,
+        # so no package outside internal/theme can turn a hand-built Palette
+        # into a *theme.Styles by ANY route — struct literal, zero value, or
+        # mutated copy of a registered one. Two of those three contain no
+        # "theme.Palette{" text, so no textual rule could ever have closed
+        # them, and a rule that looks complete but is not is worse than one
+        # honestly labelled. This pattern remains as a tripwire: naming the
+        # type outside the registry is a sign someone is reaching for the
+        # route that compile's unexporting removed, and a palette built
+        # outside the registry is invisible to the contrast suite, which
+        # iterates theme.Names(). Styles are obtained via theme.StylesFor.
+        - pattern: 'theme\.Palette'
+          msg: "build palettes only in internal/theme; get styles with theme.StylesFor (spec §3.2)"
 
     # Spec §3.1, enforced rather than documented.
     depguard:
@@ -54,15 +68,20 @@ linters:
             - pkg: github.com/vmihailenco/msgpack/v5
               desc: "the UI must never decode wire format (spec §3.1)"
 
+        # Deny-by-default, then carve out the three places a TUI import is
+        # legitimate. The earlier form enumerated the seven ingest packages by
+        # path, which is fail-OPEN: internal/export was added later, matched no
+        # pattern, and silently escaped the layer rule entirely — it complied by
+        # luck, not by enforcement, and every future non-UI package would have
+        # inherited the same hole. This project enforces structurally rather
+        # than by convention, and a rule that looks complete but is not is worse
+        # than one honestly labelled.
         ingest-must-not-import-tui:
           files:
-            - "**/internal/saltipc/**"
-            - "**/internal/salttag/**"
-            - "**/internal/cache/**"
-            - "**/internal/filter/**"
-            - "**/internal/stats/**"
-            - "**/internal/config/**"
-            - "**/internal/model/**"
+            - "$all"
+            - "!**/internal/ui/**"
+            - "!**/internal/theme/**"
+            - "!**/cmd/**"
           deny:
             - pkg: github.com/charmbracelet/bubbletea
               desc: "the ingest layer must not import bubbletea (spec §3.1)"

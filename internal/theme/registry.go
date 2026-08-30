@@ -65,6 +65,27 @@ func Get(name string) (Palette, bool) {
 	return p, ok
 }
 
+// StylesFor compiles the REGISTERED palette called name, reporting false when
+// no such palette exists.
+//
+// This is the only route from outside the package to a *Styles, and it is the
+// mechanism — not a lint pattern — that confines colour to the registry
+// (spec §3.2). Because the palette can only come from palettes, every set of
+// styles any pane can ever render with is one TestContrastPassesAfter256Colour
+// Quantisation already checked by iterating Names().
+//
+// The root model is the sole caller in the UI: panes receive the *Styles as a
+// View parameter and never fetch their own, so a theme switch is one
+// assignment and loses nothing.
+func StylesFor(name string) (*Styles, bool) {
+	p, ok := Get(name)
+	if !ok {
+		return nil, false
+	}
+
+	return compile(p), true
+}
+
 // Next returns the palette after name, wrapping. Drives the `t` key.
 func Next(name string) string {
 	names := Names()

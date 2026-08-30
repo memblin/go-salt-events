@@ -37,9 +37,22 @@ type Styles struct {
 	Err  lipgloss.Style
 }
 
-// Compile builds a *Styles from p. For the mono palette (every slot empty) it
+// compile builds a *Styles from p. For the mono palette (every slot empty) it
 // skips Foreground/Background entirely and relies on Bold and Reverse alone.
-func Compile(p Palette) *Styles {
+//
+// It is deliberately unexported. Exported, it was an API-level hole in the
+// colour rule: any package could obtain styled colour with no forbidden text
+// in its own source, by handing it a Palette built from a struct literal, a
+// zero value, or a mutated copy of a registered one. Two of those three
+// contain no "theme.Palette{" text at all, so no textual lint rule can close
+// them. Such a palette never passes through the registry, and the contrast
+// suite iterates Names() — so it would be structurally invisible to contrast
+// validation, and an unreadable pane could ship with no failing test
+// (spec §3.2).
+//
+// StylesFor is the only way in from outside, and it sources its palette from
+// the registry. Do not re-export this.
+func compile(p Palette) *Styles {
 	s := &Styles{Palette: p}
 
 	fg := func(st lipgloss.Style, c Color) lipgloss.Style {

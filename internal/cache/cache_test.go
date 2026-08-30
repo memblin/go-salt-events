@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/TKC-Labs/go-salt-events/internal/cache"
+	"github.com/TKC-Labs/go-salt-events/internal/filter"
 	"github.com/TKC-Labs/go-salt-events/internal/model"
 )
 
@@ -501,5 +502,72 @@ func TestCacheDegradationNeverLosesTheAccounting(t *testing.T) {
 
 	if got := c.Stats(); got.Used != want {
 		t.Errorf("Used = %d, want %d (the sum of retained event sizes)", got.Used, want)
+	}
+}
+
+// TestFilterQuerySatisfiesMatcher closes the seam Task 11 left open.
+//
+// Matcher exists so that package cache does not import internal/filter, and it
+// still does not: this is the external cache_test package, so no production
+// import is added in either direction. A filter.Query satisfies Matcher
+// structurally, with neither package naming the other. The assignment below is
+// the whole point — if the two ever drift apart, this stops compiling.
+func TestFilterQuerySatisfiesMatcher(t *testing.T) {
+	t.Parallel()
+
+	q, err := filter.Parse("salt/auth")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	var m cache.Matcher = q
+
+	if !m.Match(model.Event{Tag: "salt/auth"}) {
+		t.Error("filter.Query does not work as a cache.Matcher")
+	}
+}
+
+// TestSnapshotFiltersWithARealQuery is the seam doing its actual job.
+//
+// It also pins, against a real query rather than a hand-written matcher, the
+// behaviour Task 11 built in for this moment: the matcher is applied before
+// the limit, walking newest to oldest, so a filter returns the newest matches
+// rather than the matches among the newest events. The opposite would blank
+// the pane whenever the matching events were older than the visible window —
+// exactly when an operator is filtering to find them.
+func TestSnapshotFiltersWithARealQuery(t *testing.T) {
+	t.Parallel()
+
+	c := cache.New(1 << 20)
+
+	// Two old matches, then enough newer noise to push them out of any
+	// plausible visible window.
+	c.Add(event("salt/job/20260830081402123456/ret/web-1", 10))
+	c.Add(event("salt/job/20260830081402123456/ret/web-2", 10))
+
+	for i := range 50 {
+		c.Add(event(fmt.Sprintf("salt/minion/web-%d/start", i), 10))
+	}
+
+	q, err := filter.Parse("salt/job/*/ret/*")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	got := c.Snapshot(q, 10)
+
+	want := []string{
+		"salt/job/20260830081402123456/ret/web-1",
+		"salt/job/20260830081402123456/ret/web-2",
+	}
+
+	if len(got) != len(want) {
+		t.Fatalf("Snapshot returned %d events, want %d", len(got), len(want))
+	}
+
+	for i, e := range got {
+		if e.Tag != want[i] {
+			t.Errorf("event %d: Tag = %q, want %q", i, e.Tag, want[i])
+		}
 	}
 }
