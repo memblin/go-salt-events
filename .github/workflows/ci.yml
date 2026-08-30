@@ -1,0 +1,200 @@
+name: CI
+
+# Run on pull requests only. The pull_request event tests the PR head merged
+# into main, so a green PR already validates the post-merge state; re-running on
+# push to main would just re-test identical code and waste CI minutes.
+#
+# paths-ignore uses an exclusion list (fail-open) rather than an inclusion list:
+# unknown new file types still trigger CI, so we never silently skip a build
+# because someone added a new relevant asset category.
+#
+# docs-extra/ and .superpowers/ are git-ignored working areas (design docs and
+# the agent workspace); they are listed anyway so a stray commit of either can
+# never be the thing that gates a merge.
+on:
+  pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'docs-extra/**'
+      - '.superpowers/**'
+      - 'HANDOFF.md'
+      - 'LICENSE'
+      - '.gitignore'
+
+# Least-privilege by default; jobs opt into more if they need it.
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref to save CI minutes.
+#
+# The group MUST be distinct per pull request. If github.ref does not evaluate
+# per-PR on this Gitea version, every PR shares one group and each new run
+# cancels the in-flight one -- which, combined with the cancelled-job bug the
+# `check` job guards against, silently produces green checks on untested code.
+# The probe step in the `static` job prints the evaluated value so this is
+# verifiable rather than assumed.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Static analysis: build, vet, lint, fmt, tidy.
+  # Runs in parallel with the test job.
+  static:
+    name: static · build · vet · lint · fmt · tidy
+    runs-on: [alma10, vm]
+    timeout-minutes: 30
+    # completed is set ONLY by the final step. A job killed part-way through --
+    # OOM, cancellation, runner eviction -- never sets it. See the `check` job.
+    outputs:
+      completed: ${{ steps.done.outputs.completed }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      # Diagnostic: prove whether the concurrency group above is actually
+      # distinct per PR. An empty github.ref means every PR shares one group
+      # and cancels its predecessor.
+      #
+      # The values go through env rather than being interpolated straight into
+      # the shell: head_ref is an attacker-controllable branch name on a fork
+      # PR, and `${{ }}` splices raw text into the script before bash sees it.
+      - name: Probe concurrency inputs
+        env:
+          GH_REF: ${{ github.ref }}
+          GH_HEAD_REF: ${{ github.head_ref }}
+          GH_EVENT_NAME: ${{ github.event_name }}
+          GH_WORKFLOW: ${{ github.workflow }}
+        run: |
+          echo "github.ref        = '${GH_REF}'"
+          echo "github.head_ref   = '${GH_HEAD_REF}'"
+          echo "github.event_name = '${GH_EVENT_NAME}'"
+          echo "concurrency group = 'ci-${GH_WORKFLOW}-${GH_REF}'"
+
+      # Go is installed natively on the self-hosted runners (must satisfy the
+      # go.mod `go` directive, 1.26+); no setup-go step.
+
+      # Resolve the golangci-lint version from go.mod. go.mod is the single
+      # source of truth; locally `just lint`/`just fmt` use the same version
+      # via `go tool`.
+      - name: Resolve golangci-lint version
+        id: lint-version
+        run: |
+          version="$(go list -m -f '{{.Version}}' github.com/golangci/golangci-lint/v2)"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      # golangci-lint's analysis cache persists on the runner's disk, but Gitea's
+      # act runner executes each job in a fresh ephemeral workdir, so that cache
+      # (keyed by absolute path) goes stale every run and would replay phantom
+      # findings against dead paths. The Lint step below cleans it first. (An
+      # actions/cache step is moot anyway: unsupported on Gitea, no benefit here.)
+
+      # For fast CI we install the PREBUILT golangci-lint rather than compiling
+      # the go.mod `tool` pin via `go tool`. The version is read from go.mod, so
+      # go.mod remains the single source of truth and there is nothing to keep
+      # in sync. Locally `just lint`/`just fmt` use the same version via go tool.
+      - name: Install golangci-lint (prebuilt)
+        env:
+          GOLANGCI_LINT_VERSION: ${{ steps.lint-version.outputs.version }}
+        run: |
+          echo "Installing golangci-lint ${GOLANGCI_LINT_VERSION}"
+          curl -sSfL "https://raw.githubusercontent.com/golangci/golangci-lint/${GOLANGCI_LINT_VERSION}/install.sh" \
+            | sh -s -- -b "${HOME}/.local/bin" "${GOLANGCI_LINT_VERSION}"
+          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: just vet
+
+      - name: Lint
+        # Clean the stale path-keyed analysis cache first (see note above), then
+        # lint — otherwise the runner replays phantom findings from a prior run's
+        # ephemeral workdir path.
+        run: |
+          golangci-lint cache clean
+          golangci-lint run
+
+      - name: Format check
+        run: golangci-lint fmt --diff
+
+      - name: Tidy check
+        run: just tidy
+
+      - name: Mark job completed
+        id: done
+        run: echo "completed=true" >> "$GITHUB_OUTPUT"
+
+  # Race-enabled tests with coverage. Runs in parallel with the static job.
+  #
+  # `just test-integration` is deliberately NOT run here. Those tests are behind
+  # //go:build integration and need a live salt-master socket and root; the
+  # runners have neither, so they would auto-skip and report a pass having
+  # verified nothing. They run on a real master instead.
+  test:
+    name: test · race
+    runs-on: [alma10, vm]
+    timeout-minutes: 30
+    # See the note on static.outputs.completed.
+    outputs:
+      completed: ${{ steps.done.outputs.completed }}
+    # The race detector requires cgo. The self-hosted Gitea runners default
+    # CGO_ENABLED=0, so set it explicitly. Requires a C compiler (gcc) on the
+    # runner.
+    env:
+      CGO_ENABLED: 1
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      # Go is installed natively on the self-hosted runners; no setup-go step.
+
+      - name: Test
+        run: just test-ci
+
+      - name: Mark job completed
+        id: done
+        run: echo "completed=true" >> "$GITHUB_OUTPUT"
+
+  # Summary gate: both parallel jobs must pass.
+  check:
+    name: check (all gates)
+    runs-on: [alma10, vm]
+    timeout-minutes: 5
+    needs: [static, test]
+    if: always()
+    steps:
+      - name: All gates passed
+        env:
+          STATIC_RESULT: ${{ needs.static.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+          STATIC_COMPLETED: ${{ needs.static.outputs.completed }}
+          TEST_COMPLETED: ${{ needs.test.outputs.completed }}
+        run: |
+          # Two independent conditions, both required.
+          #
+          # 1. The reported result must be success. This is the conventional
+          #    check and it is NOT sufficient on its own: this Gitea version has
+          #    reported a job killed mid-run as conclusion=success, which makes
+          #    this gate green on a test job that never finished.
+          #
+          # 2. The job must have reached its final step and set `completed`.
+          #    A job killed by OOM, cancellation or runner eviction never gets
+          #    there, so this cannot be faked by a conclusion mapping. It is the
+          #    load-bearing half of the guard.
+          fail=0
+          if [[ "${STATIC_RESULT}" != "success" || "${TEST_RESULT}" != "success" ]]; then
+            echo "::error::Gate failure: static=${STATIC_RESULT} test=${TEST_RESULT}"
+            fail=1
+          fi
+          if [[ "${STATIC_COMPLETED}" != "true" ]]; then
+            echo "::error::static did not run to completion (completed='${STATIC_COMPLETED}'); it was killed or cancelled part-way. Do NOT treat this run as green."
+            fail=1
+          fi
+          if [[ "${TEST_COMPLETED}" != "true" ]]; then
+            echo "::error::test did not run to completion (completed='${TEST_COMPLETED}'); it was killed or cancelled part-way. The most likely cause is the runner running out of memory -- check 'sudo dmesg -T | grep -i oom' on the runner."
+            fail=1
+          fi
+          if [[ "${fail}" -ne 0 ]]; then
+            exit 1
+          fi
+          echo "All gates passed: static=${STATIC_RESULT}/${STATIC_COMPLETED} test=${TEST_RESULT}/${TEST_COMPLETED}"
