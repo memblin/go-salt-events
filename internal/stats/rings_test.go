@@ -143,3 +143,103 @@ func TestRingsRollIntoMinuteBuckets(t *testing.T) {
 		t.Errorf("newest minute bucket = %d, want 120", got)
 	}
 }
+
+func TestRingsSummaryNowIsGapWhenNewestBucketIsAGap(t *testing.T) {
+	t.Parallel()
+
+	// A gap in the newest second must not read as "0 events/sec" — that is
+	// bit-for-bit indistinguishable from a genuinely quiet master and is
+	// exactly backwards during an incident (spec §8.2).
+	clk := stats.NewFakeClock(time.Date(2026, 8, 30, 8, 0, 0, 0, time.UTC))
+	r := stats.NewRings(clk)
+
+	r.Add(clk.Now())
+
+	from := clk.Now()
+	clk.Advance(time.Second)
+	r.MarkGap(from, clk.Now())
+
+	got := r.SummarySeconds()
+	if !got.NowIsGap {
+		t.Error("NowIsGap = false, want true when the newest bucket is a gap")
+	}
+
+	if got.Now != 0 {
+		t.Errorf("Now = %v while NowIsGap, want the zero value (callers must check NowIsGap first)", got.Now)
+	}
+}
+
+func TestRingsSummaryHasNoDataWhenTheWholeWindowIsGapped(t *testing.T) {
+	t.Parallel()
+
+	// Peak/Mean over a fully gapped window must be distinguishable from a
+	// window that genuinely saw zero events throughout.
+	clk := stats.NewFakeClock(time.Date(2026, 8, 30, 8, 0, 0, 0, time.UTC))
+	r := stats.NewRings(clk)
+
+	from := clk.Now()
+	clk.Advance(secondBucketsGapSpan)
+	r.MarkGap(from, clk.Now())
+
+	got := r.SummarySeconds()
+	if got.HasData {
+		t.Error("HasData = true, want false when every bucket in the window is a gap")
+	}
+
+	if got.Peak != 0 || got.Mean != 0 {
+		t.Errorf("Peak/Mean = %v/%v while HasData is false, want the zero value", got.Peak, got.Mean)
+	}
+
+	if !got.NowIsGap {
+		t.Error("NowIsGap = false, want true — the newest bucket is also gapped")
+	}
+}
+
+func TestRingsSurvivesAClockJumpFarBeyondTheRing(t *testing.T) {
+	t.Parallel()
+
+	// advance() must be bounded at the ring size, not at elapsed wall-clock
+	// time: a suspended host, a slow startup, or a corrupt timestamp must
+	// not turn one Add/Seconds/MarkGap call into a loop over years of ticks.
+	clk := stats.NewFakeClock(time.Date(2026, 8, 30, 8, 0, 0, 0, time.UTC))
+	r := stats.NewRings(clk)
+
+	for range 50 {
+		r.Add(clk.Now())
+	}
+
+	from := clk.Now()
+	clk.Advance(50 * 365 * 24 * time.Hour) // ~50 years — far beyond both rings.
+	r.MarkGap(from, clk.Now())
+
+	secs := r.Seconds()
+	if len(secs) != 120 {
+		t.Fatalf("Seconds() length = %d, want 120", len(secs))
+	}
+
+	for i, b := range secs {
+		if b.Count != 0 {
+			t.Errorf("secs[%d].Count = %d, want 0 after a jump far beyond the ring", i, b.Count)
+		}
+	}
+
+	mins := r.Minutes()
+	if len(mins) != 60 {
+		t.Fatalf("Minutes() length = %d, want 60", len(mins))
+	}
+
+	for i, b := range mins {
+		if b.Count != 0 {
+			t.Errorf("mins[%d].Count = %d, want 0 after a jump far beyond the ring", i, b.Count)
+		}
+	}
+
+	got := r.SummarySeconds()
+	if got.Peak != 0 {
+		t.Errorf("Peak = %v after a jump far beyond the ring, want 0", got.Peak)
+	}
+}
+
+// secondBucketsGapSpan spans the whole 120-bucket second window so a MarkGap
+// call over it gaps every bucket, none left over from before the window.
+const secondBucketsGapSpan = stats.SecondBuckets * time.Second

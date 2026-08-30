@@ -15,6 +15,13 @@ type Entry struct {
 }
 
 // Counter is a top-N counter with bounded cardinality.
+//
+// Counter is NOT safe for concurrent use — concurrent map access on counts
+// would crash outright, not just race. The architecture serialises access
+// externally: a reader goroutine feeds it under the hub's mutex (Task 21),
+// and the UI reads a snapshot assembled under that same lock. Do not add a
+// mutex here — that would nest a second lock inside one already held on
+// every ingest.
 type Counter struct {
 	maxKeys int
 	counts  map[string]uint64
