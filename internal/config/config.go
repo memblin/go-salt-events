@@ -38,6 +38,27 @@ const (
 	flagNoColor   = "no-color"
 )
 
+// UsageExtra documents the capture flags, which this package deliberately does
+// NOT parse.
+//
+// They are handled in cmd/salt-events before Load is called, because a fixture
+// recorder is a different program that happens to share a binary rather than a
+// runtime setting — putting it in Config would drag it into the precedence
+// table, the TOML schema and the SALTEV_ namespace, where it means nothing.
+//
+// But this package owns the FlagSet, and the FlagSet is what prints -h. So a
+// flag that works and is undocumented is the outcome unless the two are joined
+// here. TestHelpDocumentsTheCaptureFlags pins this text to the constants
+// cmd/salt-events actually parses, so a rename there fails the build's tests
+// rather than silently rotting the help output.
+const UsageExtra = `
+Fixture recording (see just capture):
+  -capture int
+    	record N frames from the bus and exit, instead of starting the console
+  -capture-out string
+    	file to write recorded frames to (required with -capture)
+`
+
 // Environment keys (spec §11: SALTEV_<KEY>).
 const (
 	envSockDir   = "SALTEV_SOCK_DIR"
@@ -163,6 +184,16 @@ func parseFlags(args []string) (flagValues, string, error) {
 	fset.Int64Var(&flags.cfg.ExportMax, flagExportMax, flags.cfg.ExportMax, "maximum export size in bytes")
 	fset.IntVar(&flags.cfg.MaxJobs, flagMaxJobs, flags.cfg.MaxJobs, "jobs retained in the correlation index")
 	fset.BoolVar(&flags.cfg.NoColor, flagNoColor, flags.cfg.NoColor, "disable colour")
+
+	// The default Usage prints only the flags registered above, which silently
+	// hides the capture flags cmd/salt-events strips before we ever see them.
+	fset.Usage = func() {
+		out := fset.Output()
+
+		_, _ = fmt.Fprintf(out, "Usage of %s:\n", fset.Name())
+		fset.PrintDefaults()
+		_, _ = fmt.Fprint(out, UsageExtra)
+	}
 
 	if err := fset.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
