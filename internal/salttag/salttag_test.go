@@ -138,11 +138,16 @@ func TestParseLiveTagShapes(t *testing.T) {
 			// The master's publish-ack to the CLI. Its whole tag is the JID,
 			// so a parser that keys on it verbatim gets one Category per job —
 			// exactly the cardinality explosion Category exists to prevent.
+			// Namespace stays custom: spec §2.8 says anything not prefixed
+			// salt/ is a custom tag. Category is empty, not "*", because once
+			// the one JID segment is removed there is no category segment
+			// left; "*" would mean "any" and would collide with a literal "*"
+			// tag from event.send.
 			name: "bare jid",
 			tag:  "20260830145904725601",
 			want: salttag.Info{
-				Namespace: "job",
-				Category:  "*",
+				Namespace: "custom",
+				Category:  "",
 				JID:       "20260830145904725601",
 				Kind:      model.KindOther,
 			},
@@ -152,19 +157,31 @@ func TestParseLiveTagShapes(t *testing.T) {
 			name: "bare jid other job",
 			tag:  "20260830145909870073",
 			want: salttag.Info{
-				Namespace: "job",
-				Category:  "*",
+				Namespace: "custom",
+				Category:  "",
 				JID:       "20260830145909870073",
 				Kind:      model.KindOther,
 			},
 		},
 		{
+			// A minion can event.send a tag whose entire text is "*". It must
+			// not share a Category with the publish-ack above.
+			name: "literal star tag",
+			tag:  "*",
+			want: salttag.Info{
+				Namespace: "custom",
+				Category:  "*",
+				Kind:      model.KindOther,
+			},
+		},
+		{
 			// Fired by the master, unprefixed, once per minion. Keeping the
-			// minion id in Category would leak one key per minion.
+			// minion id in Category would leak one key per minion — but the
+			// namespace stays custom, per §2.8.
 			name: "minion refresh",
 			tag:  "minion/refresh/salt-1-tkclabs-io",
 			want: salttag.Info{
-				Namespace: "minion",
+				Namespace: "custom",
 				Category:  "minion/refresh/*",
 				Minion:    "salt-1-tkclabs-io",
 				Kind:      model.KindOther,
@@ -220,8 +237,8 @@ func TestParseLiveTagShapes(t *testing.T) {
 			name: "bare jid with unique_jid suffix",
 			tag:  "20260830145905616937_31337",
 			want: salttag.Info{
-				Namespace: "job",
-				Category:  "*",
+				Namespace: "custom",
+				Category:  "",
 				JID:       "20260830145905616937_31337",
 				Kind:      model.KindOther,
 			},
@@ -322,6 +339,17 @@ func TestParseCategoryCollapsesBareJIDs(t *testing.T) {
 	if a.JID == b.JID {
 		t.Errorf("bare-JID JIDs must not collapse: both %q", a.JID)
 	}
+
+	// The collapsed key is empty, not "*": a hostile event.send tag whose
+	// entire text is "*" must land in its own bucket, and the Summary pane
+	// must not be handed a row labelled with the character that means "any".
+	if a.Category != "" {
+		t.Errorf("bare-JID Category = %q, want empty", a.Category)
+	}
+
+	if star := salttag.Parse("*"); star.Category == a.Category {
+		t.Errorf("literal %q tag shares a Category with a bare JID: %q", "*", star.Category)
+	}
 }
 
 func TestParseDoesNotPanicOnDegenerateTags(t *testing.T) {
@@ -358,5 +386,27 @@ func TestParseDoesNotPanicOnAbsurdTags(t *testing.T) {
 		if got.Namespace == "" {
 			t.Errorf("Parse(<%d bytes>) left Namespace empty", len(tag))
 		}
+	}
+}
+
+func TestParseCapsCategorySegments(t *testing.T) {
+	t.Parallel()
+
+	// The split is capped so a hand-fired tag cannot force a per-event
+	// allocation proportional to its separator count. The cap is observable on
+	// a job-shaped tag: everything past it collapses into the final segment,
+	// which is starred out with the rest of the minion tail, so Category can
+	// never carry more than the cap's worth of segments however long the tag.
+	const maxSegments = 64
+
+	got := salttag.Parse(strings.Repeat("salt/job/20260830081402123456/ret/x/", 10000))
+
+	if n := strings.Count(got.Category, "/") + 1; n != maxSegments {
+		t.Errorf("Category has %d segments, want %d: %.120q", n, maxSegments, got.Category)
+	}
+
+	// The collapsed tail must not leak raw separators back into the key.
+	if want := "salt/job/*/ret/" + strings.TrimSuffix(strings.Repeat("*/", 60), "/"); got.Category != want {
+		t.Errorf("Category = %.200q, want %.200q", got.Category, want)
 	}
 }
