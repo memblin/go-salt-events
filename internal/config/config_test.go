@@ -25,6 +25,17 @@ func writeConfig(t *testing.T, body string) string {
 	return path
 }
 
+// absentConfigPath returns a path that provably has nothing at it, inside a
+// directory scoped to the calling test. Passing this via --config pins
+// Load's file tier to the well-defined "no file" case (defaults, no error)
+// regardless of what — if anything — sits at the real /etc/salt-events/
+// config.toml on the host running the suite.
+func absentConfigPath(t *testing.T) string {
+	t.Helper()
+
+	return filepath.Join(t.TempDir(), "absent.toml")
+}
+
 func TestLoadPrecedenceFlagsBeatEnvironment(t *testing.T) {
 	t.Parallel()
 
@@ -36,7 +47,7 @@ func TestLoadPrecedenceFlagsBeatEnvironment(t *testing.T) {
 		return ""
 	}
 
-	cfg, err := config.Load([]string{"--max-jobs=2000"}, env)
+	cfg, err := config.Load([]string{"--config=" + absentConfigPath(t), "--max-jobs=2000"}, env)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -57,7 +68,7 @@ func TestLoadEnvironmentBeatsDefaults(t *testing.T) {
 		return ""
 	}
 
-	cfg, err := config.Load(nil, env)
+	cfg, err := config.Load([]string{"--config=" + absentConfigPath(t)}, env)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -71,12 +82,13 @@ func TestLoadRejectsNonPositiveBudgets(t *testing.T) {
 	t.Parallel()
 
 	env := func(string) string { return "" }
+	cfgFlag := "--config=" + absentConfigPath(t)
 
-	if _, err := config.Load([]string{"--max-memory=0"}, env); err == nil {
+	if _, err := config.Load([]string{cfgFlag, "--max-memory=0"}, env); err == nil {
 		t.Error("expected an error for --max-memory=0")
 	}
 
-	if _, err := config.Load([]string{"--max-jobs=-1"}, env); err == nil {
+	if _, err := config.Load([]string{cfgFlag, "--max-jobs=-1"}, env); err == nil {
 		t.Error("expected an error for --max-jobs=-1")
 	}
 }
@@ -219,7 +231,7 @@ func TestLoadRejectsMalformedEnvironmentValues(t *testing.T) {
 				return ""
 			}
 
-			_, err := config.Load(nil, env)
+			_, err := config.Load([]string{"--config=" + absentConfigPath(t)}, env)
 			if err == nil {
 				t.Fatalf("expected an error for %s=%q", tt.key, tt.val)
 			}
@@ -249,7 +261,7 @@ func TestLoadAppliesTheRemainingEnvironmentSettings(t *testing.T) {
 		}
 	}
 
-	cfg, err := config.Load(nil, env)
+	cfg, err := config.Load([]string{"--config=" + absentConfigPath(t)}, env)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -277,6 +289,7 @@ func TestLoadDoesNotOverrideAnExplicitSockDir(t *testing.T) {
 	const long = "/srv/salt/run/master/sockets/here"
 
 	fileWithSockDir := writeConfig(t, "sock_dir = \""+long+"\"\n")
+	absentPath := absentConfigPath(t)
 
 	tests := []struct {
 		name string
@@ -286,13 +299,13 @@ func TestLoadDoesNotOverrideAnExplicitSockDir(t *testing.T) {
 	}{
 		{
 			name: "explicit flag survives",
-			args: []string{"--sock-dir=" + long},
+			args: []string{"--config=" + absentPath, "--sock-dir=" + long},
 			env:  noEnv,
 			want: long,
 		},
 		{
 			name: "explicit environment value survives",
-			args: nil,
+			args: []string{"--config=" + absentPath},
 			env: func(k string) string {
 				if k == "SALTEV_SOCK_DIR" {
 					return long
@@ -310,7 +323,7 @@ func TestLoadDoesNotOverrideAnExplicitSockDir(t *testing.T) {
 		},
 		{
 			name: "the default is still guarded",
-			args: nil,
+			args: []string{"--config=" + absentPath},
 			env:  noEnv,
 			want: config.DefaultSockDir,
 		},
@@ -337,7 +350,7 @@ func TestLoadRejectsAnEmptySockDir(t *testing.T) {
 
 	// SocketPath("") is "master_event_pub.ipc": a lookup in the working
 	// directory, which would produce a nonsense §8.1 diagnostic.
-	if _, err := config.Load([]string{"--sock-dir="}, noEnv); err == nil {
+	if _, err := config.Load([]string{"--config=" + absentConfigPath(t), "--sock-dir="}, noEnv); err == nil {
 		t.Error("expected an error for an empty --sock-dir")
 	}
 }
@@ -347,7 +360,7 @@ func TestLoadRejectsANonPositiveExportMax(t *testing.T) {
 
 	// ExportMax is invariant 8's hard cap; the export path must never have to
 	// guess whether a negative cap means "refuse everything" or "unlimited".
-	if _, err := config.Load([]string{"--export-max=-5"}, noEnv); err == nil {
+	if _, err := config.Load([]string{"--config=" + absentConfigPath(t), "--export-max=-5"}, noEnv); err == nil {
 		t.Error("expected an error for --export-max=-5")
 	}
 }
