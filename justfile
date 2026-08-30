@@ -67,12 +67,26 @@ build-release goos="linux" goarch="amd64":
         -o dist/salt-events-{{goos}}-{{goarch}}/salt-events \
         ./cmd/salt-events
 
+# Architectures a release publishes.
+#
+# amd64 ONLY, and not because cross-compiling is hard: `GOARCH=arm64` with
+# CGO_ENABLED=0 builds cleanly on an amd64 host and produced a valid aarch64
+# binary. It is excluded because every runner here is amd64, so an arm64
+# artefact would be published having never been EXECUTED on the architecture it
+# targets — not tested, not smoke-run, not even started. That is a guess wearing
+# a release asset's clothes, and the person who discovers it is broken is
+# someone installing it as root on their master.
+#
+# build-release stays parameterised, so re-adding an architecture is one entry
+# here plus a runner that can run its tests.
+RELEASE_ARCHES := "amd64"
+
 # Build every artefact for a release: binaries, tarballs, .deb, .rpm, checksums.
-package: (build-release "linux" "amd64") (build-release "linux" "arm64")
+package: (build-release "linux" "amd64")
     #!/usr/bin/env bash
     set -euo pipefail
     cd dist
-    for arch in amd64 arm64; do
+    for arch in {{RELEASE_ARCHES}}; do
         d="salt-events-linux-${arch}"
         install -m 0644 ../README.md ../LICENSE "${d}/"
         install -m 0644 ../docs/running.md "${d}/running.md"
@@ -82,7 +96,7 @@ package: (build-release "linux" "amd64") (build-release "linux" "arm64")
     # nfpm.yaml points at a fixed staging path, so each architecture is copied
     # into place in turn (see the note in nfpm.yaml).
     mkdir -p dist/pkgroot
-    for arch in amd64 arm64; do
+    for arch in {{RELEASE_ARCHES}}; do
         install -m 0755 "dist/salt-events-linux-${arch}/salt-events" dist/pkgroot/salt-events
         for pkg in deb rpm; do
             VERSION="{{VERSION}}" ARCH="${arch}" \

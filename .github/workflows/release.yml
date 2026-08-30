@@ -116,6 +116,34 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Both preconditions for publishing, checked BEFORE the build rather than
+      # discovered at the upload step. A missing tool reads as "command not
+      # found" and a missing secret as an opaque 401, in both cases after a
+      # successful build, which sends you looking at the wrong thing.
+      - name: Check publish preconditions
+        env:
+          GITEA_TOKEN: ${{ secrets.PACKAGING_GITEA_TOKEN }}
+        run: |
+          fail=0
+
+          if ! command -v tea >/dev/null 2>&1; then
+            echo "::error::tea is not installed on this runner. Install it (https://gitea.com/gitea/tea) or switch the publish step to the releases API."
+            fail=1
+          else
+            tea --version
+          fi
+
+          # Presence only — never echo the value, and never echo its length,
+          # which leaks information about the credential for no benefit.
+          if [[ -z "${GITEA_TOKEN}" ]]; then
+            echo "::error::The organisation secret PACKAGING_GITEA_TOKEN is unset or empty for this repository. Releases cannot be published without it."
+            fail=1
+          fi
+
+          if [[ "${fail}" -ne 0 ]]; then
+            exit 1
+          fi
+
       - name: Derive version from the tag
         id: version
         env:
@@ -138,22 +166,20 @@ jobs:
       - name: List artefacts
         run: ls -l dist/ && cat dist/sha256sums.txt
 
-      # Fail here, with a sentence saying what to install, rather than at the
-      # publish step with "tea: command not found" after a successful build.
-      - name: Check for tea
-        run: |
-          if ! command -v tea >/dev/null 2>&1; then
-            echo "::error::tea is not installed on this runner. Install it (https://gitea.com/gitea/tea) or switch the publish step to the releases API."
-            exit 1
-          fi
-          tea --version
-
       - name: Publish release
         env:
-          # tea reads the token from the environment; GITEA_TOKEN is a repo
-          # secret, not the ephemeral job token, because the job token cannot
-          # always create releases on self-hosted Gitea.
-          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+          # tea reads the token from GITEA_TOKEN in the environment. The value
+          # comes from the ORGANISATION-level secret PACKAGING_GITEA_TOKEN, not
+          # from the ephemeral job token, which cannot reliably create releases
+          # on self-hosted Gitea.
+          #
+          # The names differ on purpose and should stay that way: the secret is
+          # named for what it is FOR, so it reads sensibly across every repo in
+          # the org that publishes packages, while the environment variable is
+          # named for what tea REQUIRES. Renaming the secret to GITEA_TOKEN
+          # would make it look like a generic credential and invite reuse for
+          # things that are not packaging.
+          GITEA_TOKEN: ${{ secrets.PACKAGING_GITEA_TOKEN }}
           TAG: ${{ steps.version.outputs.tag }}
           REPO: ${{ github.repository }}
         run: |
